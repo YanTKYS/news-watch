@@ -92,6 +92,8 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(req.get_header("X-subscription-token"), SECRET)
         self.assertEqual(req.get_header("Accept"), "application/json")
         self.assertIn("count=10", req.full_url)
+        self.assertIn("search_lang=ja", req.full_url)
+        self.assertNotIn("search_lang=jp", req.full_url)
         self.assertNotIn("offset", req.full_url)
         self.assertLessEqual(collect.RESULT_COUNT, 20)
 

@@ -172,7 +172,7 @@ def build_request(query: str, api_key: str) -> urllib.request.Request:
             "q": query,
             "count": RESULT_COUNT,
             "country": "JP",
-            "search_lang": "jp",
+            "search_lang": "ja",
             "freshness": FRESHNESS,
         }
     )
