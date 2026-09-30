@@ -258,7 +258,12 @@ class RepoLayout(unittest.TestCase):
 
     def test_shipped_config_is_valid(self):
         themes = collect.load_config(self.root / "config" / "queries.yml")
-        self.assertEqual(sum(len(t.queries) for t in themes), 7)
+        queries = [q for t in themes for q in t.queries]
+        self.assertEqual(len(queries), 5)
+        self.assertEqual(queries[0], '"自治体DX"')  # 引用符付きの検索語がそのまま読み込まれる
+        self.assertEqual(queries[1], '"自治体" "デジタル化"')
+        self.assertTrue(all('"' in q for q in queries))
+        self.assertNotIn("自治体 ChatGPT", queries)
 
     def test_collect_workflow_triggers_and_permissions(self):
         import yaml
