@@ -336,6 +336,29 @@ def write_log(logs_dir: Path, today: str, items: list[Item]) -> Path:
     return path
 
 
+_MONTH_FILE_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])\.md$")
+
+
+def list_months(logs_dir: Path) -> list[str]:
+    """logs/YYYY/YYYY-MM.md を走査し、閲覧UI用の月一覧（YYYY-MM・新しい順・重複なし）を返す。"""
+    months = set()
+    for path in logs_dir.glob("*/*.md"):
+        m = _MONTH_FILE_RE.match(path.name)
+        if m and path.parent.name == m.group(1):  # 年ディレクトリとファイル名の年が一致するもののみ
+            months.add(f"{m.group(1)}-{m.group(2)}")
+    return sorted(months, reverse=True)
+
+
+def update_months(months_path: Path, logs_dir: Path) -> bool:
+    """months.json を生成・更新する。内容が変わらなければ書き込まない。変更したら True。"""
+    new = json.dumps(list_months(logs_dir), ensure_ascii=False, indent=2) + "\n"
+    if months_path.exists() and months_path.read_text(encoding="utf-8") == new:
+        return False
+    months_path.parent.mkdir(parents=True, exist_ok=True)
+    months_path.write_text(new, encoding="utf-8")
+    return True
+
+
 # ---- メイン処理 ----------------------------------------------------------
 def collect(
     config: Config,
@@ -408,6 +431,7 @@ def run(
     config_path: Path = ROOT / "config" / "queries.yml",
     seen_path: Path = ROOT / "data" / "seen.json",
     logs_dir: Path = ROOT / "logs",
+    months_path: Path = ROOT / "data" / "months.json",
     today: str | None = None,
     env: dict | None = None,
     sleep=time.sleep,
@@ -433,6 +457,7 @@ def run(
         for item in items:
             seen[item.url] = {"first_seen": today}
         save_seen(seen_path, seen)
+        update_months(months_path, logs_dir)  # 閲覧UI用。収集の成否には影響させない軽量処理
 
     print_stats(stats)
     if stats.failed_queries == stats.executed_queries:

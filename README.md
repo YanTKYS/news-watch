@@ -52,6 +52,17 @@ themes:
 同じURLは `data/seen.json` で管理し、再度記録しません（複数の検索語でヒットした場合は
 `Queries:` にまとめて1件だけ記録します）。公開日は、APIが日付を返した場合のみ `Published:` に記載します。
 
+## GitHub Pagesで読む
+
+収集したログを、月ごとのカード形式で閲覧できます（`index.html` / `parser.js` / `app.js` / `style.css`）。
+Pagesは `logs/YYYY/YYYY-MM.md` を読み込んで表示しているだけで、データの二重管理はありません。
+月の一覧 `data/months.json` は、収集時に `logs/` から自動で更新されます（手作業は不要）。
+
+公開設定: **Settings → Pages → Build and deployment → Deploy from a branch → `main` → `/ (root)`**
+公開URL例: `https://yantkys.github.io/news-watch/`
+
+ローカル確認: リポジトリ直下で `python -m http.server` を起動し、`http://localhost:8000/` を開きます。
+
 ## 実行結果の確認
 
 Actionsのログ末尾に、検索語数・APIリクエスト数・取得件数・新着件数・重複件数が表示されます。
