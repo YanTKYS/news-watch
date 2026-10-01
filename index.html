@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>news-watch</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <h1>news-watch</h1>
+      <p class="lead">自治体DX・自治体の生成AI活用に関する新着情報</p>
+      <label class="month-picker">
+        <span class="visually-hidden">表示する月</span>
+        <select id="month-select" disabled></select>
+      </label>
+    </div>
+  </header>
+  <main class="wrap">
+    <div id="status" role="status" aria-live="polite">読み込み中...</div>
+    <div id="content"></div>
+  </main>
+  <noscript><p class="wrap">このページの表示にはJavaScriptが必要です。ログは <a href="logs/">logs/</a> のMarkdownで直接読めます。</p></noscript>
+  <script src="parser.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

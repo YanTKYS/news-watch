@@ -54,13 +54,14 @@ class Base(unittest.TestCase):
         self.config.write_text(CONFIG, encoding="utf-8")
         self.seen = d / "data" / "seen.json"
         self.logs = d / "logs"
+        self.months = d / "data" / "months.json"
 
     def run_collect(self, responder, today="2026-09-30", env=None, config=None):
         env = {"BRAVE_API_KEY": SECRET} if env is None else env
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(collect.urllib.request, "urlopen", side_effect=responder) as m, \
                 redirect_stdout(out), redirect_stderr(err):
-            code = collect.run(config or self.config, self.seen, self.logs, today, env, sleep=lambda s: None)
+            code = collect.run(config or self.config, self.seen, self.logs, self.months, today, env, sleep=lambda s: None)
         return code, m, out.getvalue(), err.getvalue()
 
     def log_text(self, ym="2026/2026-09.md"):
@@ -260,6 +261,75 @@ class ExcludeFilter(Base):
         code, m, out, _ = self.run_collect(lambda *a, **k: FakeResponse(api_payload(result("https://a.example.jp/x"))))
         self.assertEqual(code, 0)
         self.assertIn("filtered items: 0", out)
+
+
+class MonthsIndex(Base):
+    def touch_log(self, rel):
+        p = self.logs / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# x\n", encoding="utf-8")
+
+    def months_value(self):
+        return json.loads(self.months.read_text(encoding="utf-8"))
+
+    def test_sorted_newest_first_across_years(self):
+        for rel in ("2026/2026-09.md", "2026/2026-10.md", "2027/2027-01.md", "2026/2026-02.md"):
+            self.touch_log(rel)
+        self.assertEqual(collect.list_months(self.logs), ["2027-01", "2026-10", "2026-09", "2026-02"])
+
+    def test_ignores_non_matching_files(self):
+        self.touch_log("2026/2026-10.md")
+        for rel in ("2026/2026-13.md", "2026/2026-00.md", "2026/notes.md", "2026/2026-9.md",
+                    "2026/2026-10.txt", "2026/2026-10.md.bak", "2025/2026-11.md", "2026-11.md",
+                    "2026/sub/2026-12.md", "2026/.gitkeep"):
+            self.touch_log(rel)
+        self.assertEqual(collect.list_months(self.logs), ["2026-10"])
+
+    def test_missing_logs_dir_and_no_duplicates(self):
+        self.assertEqual(collect.list_months(self.logs), [])
+        self.touch_log("2026/2026-10.md")
+        self.assertEqual(collect.list_months(self.logs), collect.list_months(self.logs))
+        self.assertEqual(collect.list_months(self.logs).count("2026-10"), 1)
+
+    def test_update_months_writes_only_on_change(self):
+        self.touch_log("2026/2026-09.md")
+        self.assertTrue(collect.update_months(self.months, self.logs))
+        self.assertEqual(self.months_value(), ["2026-09"])
+        mtime = self.months.stat().st_mtime_ns
+        self.assertFalse(collect.update_months(self.months, self.logs))
+        self.assertEqual(self.months.stat().st_mtime_ns, mtime)
+        self.touch_log("2026/2026-10.md")
+        self.assertTrue(collect.update_months(self.months, self.logs))
+        self.assertEqual(self.months_value(), ["2026-10", "2026-09"])
+
+    def test_run_creates_months_and_second_run_same_month_keeps_it(self):
+        n = iter(range(100))
+        responder = lambda req, timeout=None: FakeResponse(api_payload(result(f"https://e.example.jp/{next(n)}")))
+        self.run_collect(responder, today="2026-10-01")
+        self.assertEqual(self.months_value(), ["2026-10"])
+        mtime = self.months.stat().st_mtime_ns
+        self.run_collect(responder, today="2026-10-02")  # 同じ月への追記では書き換えない
+        self.assertEqual(self.months.stat().st_mtime_ns, mtime)
+        self.run_collect(responder, today="2026-11-01")
+        self.assertEqual(self.months_value(), ["2026-11", "2026-10"])
+
+    def test_no_new_items_does_not_create_or_touch_months(self):
+        responder = lambda req, timeout=None: FakeResponse(api_payload(result("https://a.example.jp/x")))
+        self.run_collect(responder)
+        before = self.months.read_text(encoding="utf-8")
+        mtime = self.months.stat().st_mtime_ns
+        self.run_collect(responder, today="2026-11-01")  # 全件既知 → 新着0件
+        self.assertEqual(self.months.read_text(encoding="utf-8"), before)
+        self.assertEqual(self.months.stat().st_mtime_ns, mtime)
+        # 新着0件の初回実行ではmonths.jsonも作らない
+        self.months.unlink()
+        self.run_collect(responder, today="2026-11-01")
+        self.assertFalse(self.months.exists())
+
+    def test_shipped_months_json_matches_logs(self):
+        root = Path(__file__).resolve().parent.parent
+        self.assertEqual(json.loads((root / "data" / "months.json").read_text(encoding="utf-8")),
+                         collect.list_months(root / "logs"))
 
 
 class Safety(Base):
