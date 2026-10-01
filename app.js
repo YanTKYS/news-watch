@@ -46,27 +46,30 @@ function renderCard(item) {
   }
   card.appendChild(title);
 
-  const meta = el("p", "meta");
-  if (item.source) meta.appendChild(el("span", "", `Source: ${item.source}`));
-  if (item.published) meta.appendChild(el("span", "", `Published: ${item.published}`));
-  if (meta.childNodes.length) card.appendChild(meta);
+  // 「example.jp ・ 2026-10-01」。どちらかが欠けても、あるものだけを表示する。
+  const metaText = [item.source, item.published].filter(Boolean).join(" ・ ");
+  if (metaText) card.appendChild(el("p", "meta", metaText));
 
   if (item.description) card.appendChild(el("p", "desc", item.description));
 
+  // リンクと補助情報はカード下部にまとめ、行内のカードで位置を揃える。
+  const bottom = el("div", "card-bottom");
   if (url) {
     const link = el("a", "open", "記事を開く →");
     link.href = url;
     link.target = "_blank";
     link.rel = "noopener noreferrer";
-    card.appendChild(link);
+    bottom.appendChild(link);
   }
-
   if (item.queries || item.retrieved) {
     const parts = [];
     if (item.retrieved) parts.push(`取得日: ${item.retrieved}`);
     if (item.queries) parts.push(`検索語: ${item.queries}`);
-    card.appendChild(el("p", "foot", parts.join(" / ")));
+    const foot = el("p", "foot", parts.join(" / "));
+    foot.title = parts.join(" / "); // 1行表示で省略された場合に全文を確認できる
+    bottom.appendChild(foot);
   }
+  if (bottom.childNodes.length) card.appendChild(bottom);
   return card;
 }
 
@@ -97,13 +100,16 @@ function renderMonth(ym, days, order) {
     const summary = el("summary", "day-summary");
     summary.appendChild(el("span", "day-title", dateLabel(day.date)));
     summary.appendChild(el("span", "count", `${countItems(day.themes)}件`));
+    if (latest && day.date === latest) summary.appendChild(el("span", "latest", "最新")); // 日付値で判定（並び順に依存しない）
     section.appendChild(summary);
     for (const theme of day.themes) {
       const block = el("div", "theme");
       const h = el("h4", "theme-title", theme.name);
       h.appendChild(el("span", "count", `${theme.items.length}件`));
       block.appendChild(h);
-      for (const item of theme.items) block.appendChild(renderCard(item));
+      const cards = el("div", "theme-cards"); // テーマごとに独立したGrid
+      for (const item of theme.items) cards.appendChild(renderCard(item));
+      block.appendChild(cards);
       section.appendChild(block);
     }
     frag.appendChild(section);
