@@ -12,3 +12,15 @@ themes:
     queries:
       - '"自治体" "生成AI"'
       - '"市役所" "生成AI"'
+
+# 明らかなノイズ・転載を除外します（検索語に NOT site: を付与し、取得後にも同じ条件で除外）。
+# exclude_domains: ドメイン名のみ（サブドメインも対象）。http:// やパスは書けません。
+exclude_domains:
+  - wikipedia.org
+  - headtopics.com
+  - topics.smt.docomo.ne.jp
+
+# exclude_url_patterns: URL（スキームを除く）に含まれる文字列。ドメイン全体は残したい転載URL向け。
+exclude_url_patterns:
+  - "iza.ne.jp/pressrelease/prtimes/"
+  - "excite.co.jp/news/article/Prtimes_"
