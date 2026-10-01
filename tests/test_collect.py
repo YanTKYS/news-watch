@@ -332,6 +332,213 @@ class MonthsIndex(Base):
                          collect.list_months(root / "logs"))
 
 
+JEV_SECRET = "dummy-jev-key-for-tests"  # 実キーではないテスト用ダミー値
+
+
+def jev_payload(noul):
+    return {"model": "typesafe/jev-1.13", "answers": {"relevant": {"type": "noul", "noul": noul}},
+            "usage": {"input_tokens": 100, "output_tokens": 5}}
+
+
+class JevFilter(Base):
+    """Jev APIは常にmock。実APIは呼ばない。"""
+
+    def setUp(self):
+        super().setUp()
+        self.brave_calls, self.jev_reqs = [], []
+        self.jev_scores = {}  # URL（Title行に含めたもの）ではなく、Titleをキーにスコアを返す
+        self.brave_results = lambda query: []
+        self.jev_behavior = None  # callable(req, n) -> FakeResponse / raise
+
+    def responder(self, req, timeout=None):
+        if req.full_url.startswith(collect.JEV_ENDPOINT):
+            self.jev_reqs.append(req)
+            if self.jev_behavior:
+                return self.jev_behavior(req, len(self.jev_reqs))
+            title = json.loads(req.data)["state"].split("\n")[0].removeprefix("Title: ")
+            return FakeResponse(jev_payload(self.jev_scores.get(title, 0.9)))
+        self.brave_calls.append(req.full_url)
+        query = collect.urllib.parse.parse_qs(collect.urllib.parse.urlsplit(req.full_url).query)["q"][0]
+        return FakeResponse(api_payload(*self.brave_results(query)))
+
+    def go(self, jev_key=JEV_SECRET, **kw):
+        env = {"BRAVE_API_KEY": SECRET}
+        if jev_key:
+            env["JEV_API_KEY"] = jev_key
+        return self.run_collect(self.responder, env=env, **kw)
+
+    def saved_urls(self):
+        return set(json.loads(self.seen.read_text(encoding="utf-8"))) if self.seen.exists() else set()
+
+    # --- 利用量 ---
+    def test_excluded_and_seen_urls_never_reach_jev(self):
+        self.config.write_text(CONFIG + "exclude_domains: [wikipedia.org]\n"
+                               "exclude_url_patterns: [iza.ne.jp/pressrelease/prtimes/]\n", encoding="utf-8")
+        self.seen.parent.mkdir(parents=True)
+        self.seen.write_text(json.dumps({"https://known.example.jp/a": {"first_seen": "2026-09-01"}}), encoding="utf-8")
+        self.brave_results = lambda q: [
+            result("https://ja.wikipedia.org/wiki/x", "wiki"),
+            result("https://www.iza.ne.jp/pressrelease/prtimes/1", "repost"),
+            result("https://known.example.jp/a", "known"),
+            result("https://new.example.jp/a", "new"),
+        ]
+        code, _, out, _ = self.go()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.jev_reqs), 1)  # ユニークな新規候補のみ
+        self.assertIn("Title: new\n", json.loads(self.jev_reqs[0].data)["state"])
+        for line in ["Jev candidates: 1", "Jev requests: 1", "Jev relevant: 1", "Jev irrelevant: 0", "Jev skipped/fallback: 0"]:
+            self.assertIn(line, out)
+
+    def test_same_url_from_many_queries_calls_jev_once(self):
+        self.config.write_text('themes:\n  - name: t\n    queries: [q1, q2, q3, q4, q5]\n', encoding="utf-8")
+        self.brave_results = lambda q: [result("https://same.example.jp/a", "same")]
+        code, _, out, _ = self.go()
+        self.assertEqual((code, len(self.brave_calls), len(self.jev_reqs)), (0, 5, 1))
+        state = json.loads(self.jev_reqs[0].data)["state"]
+        self.assertIn("Search queries: q1 / q2 / q3 / q4 / q5", state)  # Queriesは統合されて渡る
+        self.assertIn("- Queries: q1 / q2 / q3 / q4 / q5", self.log_text())
+
+    def test_hard_limit_and_fail_open_after_limit(self):
+        # 1クエリ10件まで取得できるので、3クエリで30候補（上限20を超える）を作る
+        self.config.write_text('themes:\n  - name: t\n    queries: [qa, qb, qc]\n', encoding="utf-8")
+        self.brave_results = lambda q: [result(f"https://e.example.jp/{q}/{i}", f"{q}{i}") for i in range(10)]
+        self.jev_scores = {f"qc{i}": 0.0 for i in range(10)}  # 上限後の候補（非関連相当）も保存される
+        code, _, out, _ = self.go()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.jev_reqs), collect.MAX_JEV_REQUESTS)
+        self.assertEqual(len(self.saved_urls()), 30)  # 20件判定(関連) + 上限到達の10件はfail-openで保存
+        for line in ["Jev candidates: 30", "Jev requests: 20", "Jev relevant: 20", "Jev skipped/fallback: 10", "new items: 30"]:
+            self.assertIn(line, out)
+
+    def test_invariant_requests_le_candidates_le_max(self):
+        # 3クエリ×(共通2件+固有2件)=ユニーク候補8件（共通分は統合される）
+        self.brave_results = lambda q: [result(f"https://e.example.jp/common/{i}", f"c{i}") for i in range(2)] + \
+                                       [result(f"https://e.example.jp/{q}/{i}", f"{q}{i}") for i in range(2)]
+        _, _, out, _ = self.go()
+        self.assertEqual(len(self.jev_reqs), 8)
+        self.assertLessEqual(len(self.jev_reqs), 8)  # Jev requests <= ユニーク新規候補
+        self.assertLessEqual(len(self.jev_reqs), collect.MAX_JEV_REQUESTS)
+        self.assertIn("Jev candidates: 8", out)
+        self.assertEqual(len(self.brave_calls), 3)
+
+    # --- 判定 ---
+    def test_threshold_and_irrelevant_not_saved_anywhere(self):
+        self.brave_results = lambda q: [result("https://ok.example.jp/a", "ok"),
+                                        result("https://edge.example.jp/a", "edge"),
+                                        result("https://bad.example.jp/a", "bad")]
+        self.jev_scores = {"ok": 0.95, "edge": collect.JEV_RELEVANCE_THRESHOLD, "bad": 0.29}
+        code, _, out, _ = self.go()
+        self.assertEqual(code, 0)
+        self.assertEqual(collect.JEV_RELEVANCE_THRESHOLD, 0.30)
+        text = self.log_text()
+        self.assertIn("https://ok.example.jp/a", text)
+        self.assertIn("https://edge.example.jp/a", text)  # noul >= 0.30 は関連
+        self.assertNotIn("bad.example.jp", text)
+        self.assertEqual(self.saved_urls(), {"https://ok.example.jp/a", "https://edge.example.jp/a"})
+        for line in ["Jev relevant: 2", "Jev irrelevant: 1", "new items: 2"]:
+            self.assertIn(line, out)
+
+    def test_all_irrelevant_writes_nothing(self):
+        self.brave_results = lambda q: [result("https://bad.example.jp/a", "bad")]
+        self.jev_scores = {"bad": 0.0}
+        code, _, out, _ = self.go()
+        self.assertEqual(code, 0)
+        self.assertFalse(self.logs.exists() or self.seen.exists() or self.months.exists())
+        self.assertIn("new items: 0", out)
+
+    def test_request_shape_and_secret_handling(self):
+        self.brave_results = lambda q: [result("https://a.example.jp/x", "T", "説明文")]
+        self.go()
+        req = self.jev_reqs[0]
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.full_url, "https://api.typesafe.ai/v1/systemone")
+        self.assertNotIn(JEV_SECRET, req.full_url)
+        self.assertEqual(req.get_header("Authorization"), f"Bearer {JEV_SECRET}")
+        body = json.loads(req.data)
+        self.assertEqual(body["model"], collect.JEV_MODEL)
+        self.assertEqual(list(body["questions"]), ["relevant"])  # 1記事につきNoul 1問
+        self.assertEqual(body["questions"]["relevant"]["type"], "noul")
+        self.assertEqual(body["state"], "Title: T\nSource: a.example.jp\nDescription: 説明文\nSearch queries: 自治体 DX / 自治体 生成AI / 市役所 生成AI")
+        self.assertNotIn(JEV_SECRET, req.data.decode("utf-8"))
+        self.assertNotIn(SECRET, req.data.decode("utf-8"))
+
+    # --- 障害時はfail-open ---
+    def test_missing_key_skips_api_and_keeps_items(self):
+        self.brave_results = lambda q: [result("https://a.example.jp/x", "a")]
+        code, _, out, _ = self.go(jev_key=None)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.jev_reqs, [])
+        self.assertIn("JEV_API_KEY is not configured", out)
+        self.assertIn("https://a.example.jp/x", self.log_text())
+        self.assertIn("Jev requests: 0", out)
+        self.assertIn("Jev skipped/fallback: 1", out)
+
+    def test_failures_keep_items_without_retry(self):
+        cases = {
+            "timeout": lambda req, n: (_ for _ in ()).throw(TimeoutError(JEV_SECRET)),
+            "http429": lambda req, n: (_ for _ in ()).throw(urllib.error.HTTPError(req.full_url, 429, JEV_SECRET, {}, io.BytesIO(JEV_SECRET.encode()))),
+            "http500": lambda req, n: (_ for _ in ()).throw(urllib.error.HTTPError(req.full_url, 500, JEV_SECRET, {}, io.BytesIO(b""))),
+            "badjson": lambda req, n: type("R", (FakeResponse,), {"read": lambda self, n=-1: b"{not json"})({}),
+            "no_noul": lambda req, n: FakeResponse({"answers": {"relevant": {"type": "noul"}}}),
+            "no_answers": lambda req, n: FakeResponse({"model": "x"}),
+            "non_numeric": lambda req, n: FakeResponse({"answers": {"relevant": {"type": "noul", "noul": "high"}}}),
+            "bool": lambda req, n: FakeResponse({"answers": {"relevant": {"type": "noul", "noul": True}}}),
+            "out_of_range": lambda req, n: FakeResponse(jev_payload(1.5)),
+        }
+        for name, behavior in cases.items():
+            with self.subTest(name):
+                for p in (self.logs, self.seen, self.months):
+                    if p.is_dir():
+                        import shutil; shutil.rmtree(p)
+                    elif p.exists():
+                        p.unlink()
+                self.jev_reqs.clear()
+                self.jev_behavior = behavior
+                self.brave_results = lambda q: [result("https://a.example.jp/x", "a")]
+                code, _, out, err = self.go()
+                self.assertEqual(code, 0)
+                self.assertEqual(len(self.jev_reqs), 1)  # リトライなし
+                self.assertIn("https://a.example.jp/x", self.log_text())
+                self.assertEqual(self.saved_urls(), {"https://a.example.jp/x"})
+                self.assertIn("Jev skipped/fallback: 1", out)
+                self.assertNotIn(JEV_SECRET, out + err + self.log_text())
+
+    def test_one_failure_does_not_stop_others(self):
+        self.brave_results = lambda q: [result("https://a.example.jp/1", "a1"), result("https://a.example.jp/2", "a2"),
+                                        result("https://a.example.jp/3", "a3")]
+        self.jev_scores = {"a3": 0.0}
+
+        def behavior(req, n):
+            if n == 1:
+                raise urllib.error.URLError("down")
+            title = json.loads(req.data)["state"].split("\n")[0].removeprefix("Title: ")
+            return FakeResponse(jev_payload(self.jev_scores.get(title, 0.9)))
+
+        self.jev_behavior = behavior
+        _, _, out, _ = self.go()
+        self.assertEqual(len(self.jev_reqs), 3)
+        self.assertEqual(self.saved_urls(), {"https://a.example.jp/1", "https://a.example.jp/2"})
+        for line in ["Jev relevant: 1", "Jev irrelevant: 1", "Jev skipped/fallback: 1"]:
+            self.assertIn(line, out)
+
+    def test_brave_request_count_unchanged_by_jev(self):
+        self.brave_results = lambda q: [result(f"https://e.example.jp/{q}", q)]
+        self.go()
+        self.assertEqual(len(self.brave_calls), 3)  # 1検索語=1リクエスト
+        self.assertTrue(all(u.startswith(collect.API_ENDPOINT) for u in self.brave_calls))
+
+    def test_workflow_passes_jev_secret_only_to_collect_step(self):
+        import yaml
+        root = Path(__file__).resolve().parent.parent
+        wf = yaml.safe_load((root / ".github/workflows/collect.yml").read_text(encoding="utf-8"))
+        steps = wf["jobs"]["collect"]["steps"]
+        with_jev = [st for st in steps if "JEV_API_KEY" in st.get("env", {})]
+        self.assertEqual([st["name"] for st in with_jev], ["Collect"])
+        self.assertEqual(with_jev[0]["env"]["JEV_API_KEY"], "${{ secrets.JEV_API_KEY }}")
+        self.assertEqual(wf["permissions"], {"contents": "write"})
+        self.assertNotIn("secrets", (root / ".github/workflows/test.yml").read_text(encoding="utf-8"))
+
+
 class Safety(Base):
     def test_missing_api_key_stops_without_api_call(self):
         for env in ({}, {"BRAVE_API_KEY": ""}, {"BRAVE_API_KEY": "  "}):

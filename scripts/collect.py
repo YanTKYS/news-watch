@@ -39,6 +39,21 @@ TIMEOUT_SEC = 15
 MAX_RESPONSE_BYTES = 2_000_000
 USER_AGENT = "news-watch/1.0 (+https://github.com/YanTKYS/news-watch)"
 
+# ---- Jev（関連性フィルタ）。追加フィルタであり、失敗時は記事を残す（fail-open） -------
+JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"  # Jev System One API
+JEV_MODEL = "typesafe/jev-1.13"
+JEV_QUESTION_KEY = "relevant"
+JEV_INSTRUCTIONS = (
+    "この情報は、日本の自治体・地方公共団体におけるDX、デジタル化、"
+    "生成AI、AI活用、行政業務改善についての具体的なニュース、事例、"
+    "制度、調査、実証、導入、サービス、取組に実質的に関係しているか。"
+    "単に「DX」「AI」「自治体」等の単語が偶然含まれるだけの記事は false とする。"
+)
+MAX_JEV_REQUESTS = 20  # 1回の実行でのJev API呼び出しのハードリミット（超過分は判定せず保存）
+JEV_TIMEOUT_SEC = 15
+JEV_RELEVANCE_THRESHOLD = 0.30  # noul(Yes確率) がこの値未満の場合のみ非関連として除外（Recall優先）
+MAX_JEV_RESPONSE_BYTES = 100_000
+
 JST = timezone(timedelta(hours=9))
 
 # 記事の同一性に影響しないことが明らかなトラッキング用パラメータのみ除去する。
@@ -86,6 +101,11 @@ class Stats:
     filtered_items: int = 0
     new_items: int = 0
     duplicate_items: int = 0
+    jev_candidates: int = 0
+    jev_requests: int = 0
+    jev_relevant: int = 0
+    jev_irrelevant: int = 0
+    jev_fallback: int = 0  # APIキー未設定・失敗・上限到達などで判定せず保存した件数
 
 
 # ---- 設定 ---------------------------------------------------------------
@@ -261,6 +281,73 @@ def describe_error(e: Exception) -> str:
     return type(e).__name__
 
 
+# ---- Jev関連性判定 -------------------------------------------------------
+def build_jev_request(item: "Item", api_key: str) -> urllib.request.Request:
+    """Braveから取得済みの情報のみを state に渡す（本文取得・APIキーは含めない）。"""
+    lines = [f"Title: {item.title}", f"Source: {domain_of(item.url)}"]
+    if item.description:
+        lines.append(f"Description: {item.description}")
+    lines.append(f"Search queries: {' / '.join(item.queries)}")
+    body = {
+        "model": JEV_MODEL,
+        "state": "\n".join(lines),
+        "questions": {JEV_QUESTION_KEY: {"type": "noul", "instructions": JEV_INSTRUCTIONS}},
+    }
+    return urllib.request.Request(
+        JEV_ENDPOINT,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+
+
+def jev_relevance(item: "Item", api_key: str) -> float:
+    """1記事につき1回だけJevへ問い合わせ、noul(Yes確率)を返す。失敗・不正な応答は例外（リトライしない）。"""
+    with urllib.request.urlopen(build_jev_request(item, api_key), timeout=JEV_TIMEOUT_SEC) as resp:
+        data = json.loads(resp.read(MAX_JEV_RESPONSE_BYTES))
+    answer = data["answers"][JEV_QUESTION_KEY]
+    value = answer["noul"]
+    if answer.get("type") != "noul" or isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("unexpected answer")
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("noul out of range")
+    return float(value)
+
+
+def filter_by_relevance(items: list["Item"], jev_api_key: str, stats: Stats) -> list["Item"]:
+    """既存フィルタ・既知URL除外・同一実行内の統合を終えたユニーク候補だけをJevで判定する。
+
+    明確に非関連（noul < 閾値）と正常に判定された記事のみ除外し、それ以外は保存する（fail-open）。
+    """
+    stats.jev_candidates = len(items)
+    kept: list[Item] = []
+    for item in items:
+        if not jev_api_key or stats.jev_requests >= MAX_JEV_REQUESTS:
+            kept.append(item)
+            stats.jev_fallback += 1
+            continue
+        stats.jev_requests += 1
+        try:
+            score = jev_relevance(item, jev_api_key)
+        except Exception as e:  # リトライしない。本文・ヘッダ・キーは出力しない。
+            kept.append(item)
+            stats.jev_fallback += 1
+            print(f"::warning::jev failed (kept): error={describe_error(e)}")
+            continue
+        if score < JEV_RELEVANCE_THRESHOLD:
+            stats.jev_irrelevant += 1
+        else:
+            stats.jev_relevant += 1
+            kept.append(item)
+    stats.new_items = len(kept)
+    return kept
+
+
 # ---- 永続化 --------------------------------------------------------------
 def load_seen(path: Path) -> dict[str, dict]:
     if not path.exists():
@@ -423,8 +510,13 @@ def print_stats(s: Stats) -> None:
     print(f"failed queries: {s.failed_queries}")
     print(f"results received: {s.results_received}")
     print(f"filtered items: {s.filtered_items}")
-    print(f"new items: {s.new_items}")
     print(f"duplicate items: {s.duplicate_items}")
+    print(f"Jev candidates: {s.jev_candidates}")
+    print(f"Jev requests: {s.jev_requests}")
+    print(f"Jev relevant: {s.jev_relevant}")
+    print(f"Jev irrelevant: {s.jev_irrelevant}")
+    print(f"Jev skipped/fallback: {s.jev_fallback}")
+    print(f"new items: {s.new_items}")
 
 
 def run(
@@ -451,6 +543,11 @@ def run(
     except ConfigError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
+
+    jev_api_key = (env.get("JEV_API_KEY") or "").strip()
+    if not jev_api_key:  # Jevは追加フィルタ。未設定でも収集は継続する
+        print("::warning::JEV_API_KEY is not configured; relevance filtering is skipped.")
+    items = filter_by_relevance(items, jev_api_key, stats)
 
     if items:
         write_log(logs_dir, today, items)  # ログ→seenの順（途中失敗時に記事を取りこぼさない）

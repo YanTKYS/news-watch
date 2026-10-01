@@ -33,6 +33,7 @@ jobs:
       - name: Collect
         env:
           BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
         run: python scripts/collect.py
 
       - name: Commit and push if there are new items
