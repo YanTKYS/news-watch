@@ -166,6 +166,102 @@ class ParseAndMerge(Base):
         self.assertTrue((self.logs / "2026" / "2026-10.md").read_text(encoding="utf-8").startswith("# 2026年10月\n\n## 2026-10-01"))
 
 
+DOMAINS = ["wikipedia.org", "headtopics.com", "topics.smt.docomo.ne.jp"]
+PATTERNS = ["iza.ne.jp/pressrelease/prtimes/", "excite.co.jp/news/article/Prtimes_"]
+
+
+class ExcludeFilter(Base):
+    def test_domain_matching_respects_boundaries_and_case(self):
+        ex = lambda u: collect.is_excluded(collect.normalize_url(u), DOMAINS, [])
+        self.assertTrue(ex("https://wikipedia.org/wiki/x"))
+        self.assertTrue(ex("https://ja.wikipedia.org/wiki/x"))
+        self.assertTrue(ex("https://EN.Wikipedia.ORG/wiki/x"))
+        self.assertTrue(ex("https://topics.smt.docomo.ne.jp/article/1"))
+        self.assertFalse(ex("https://fakewikipedia.org/wiki/x"))
+        self.assertFalse(ex("https://wikipedia.org.example.jp/x"))
+        self.assertFalse(ex("https://www.docomo.ne.jp/x"))
+        self.assertFalse(ex("https://example.jp/wikipedia.org"))  # パスは対象外
+        self.assertTrue(collect.is_excluded("https://ja.wikipedia.org/x", ["WikiPedia.org".lower()], []))
+
+    def test_url_patterns_only_exclude_reposts(self):
+        ex = lambda u: collect.is_excluded(collect.normalize_url(u), [], PATTERNS)
+        self.assertTrue(ex("https://www.iza.ne.jp/pressrelease/prtimes/abc123"))
+        self.assertTrue(ex("https://WWW.IZA.NE.JP/pressrelease/prtimes/abc123"))
+        self.assertTrue(ex("https://www.excite.co.jp/news/article/Prtimes_2026-10-01_123"))
+        self.assertFalse(ex("https://www.iza.ne.jp/news/abc123"))
+        self.assertFalse(ex("https://www.excite.co.jp/news/article/Mynavi_123"))
+        self.assertFalse(ex("https://prtimes.jp/main/html/rd/p/000000001.000000001.html"))
+
+    def test_pattern_host_is_lowercased_in_config(self):
+        self.config.write_text(CONFIG + 'exclude_url_patterns:\n  - "IZA.ne.jp/Pressrelease/"\n', encoding="utf-8")
+        cfg = collect.load_config(self.config)
+        self.assertEqual(cfg.exclude_url_patterns, ["iza.ne.jp/Pressrelease/"])
+
+    def test_request_query_has_not_site_and_no_key_in_url(self):
+        req = collect.build_request('"自治体DX"', SECRET, DOMAINS)
+        q = collect.urllib.parse.parse_qs(collect.urllib.parse.urlsplit(req.full_url).query)["q"][0]
+        self.assertEqual(q, '"自治体DX" NOT site:wikipedia.org NOT site:headtopics.com NOT site:topics.smt.docomo.ne.jp')
+        self.assertNotIn(SECRET, req.full_url)
+        self.assertNotIn("offset", req.full_url)
+
+    def test_filtered_results_not_saved_and_counted_one_request_per_query(self):
+        urls = [
+            "https://ja.wikipedia.org/wiki/x",
+            "https://www.iza.ne.jp/pressrelease/prtimes/abc",
+            "https://www.iza.ne.jp/news/ok",
+            "https://prtimes.jp/main/html/rd/p/1.html",
+        ]
+        self.config.write_text(CONFIG + "exclude_domains: [wikipedia.org]\n"
+                               "exclude_url_patterns: [iza.ne.jp/pressrelease/prtimes/]\n", encoding="utf-8")
+        sent = []
+
+        def responder(req, timeout=None):
+            sent.append(req.full_url)
+            return FakeResponse(api_payload(*[result(u) for u in urls]))
+
+        code, m, out, _ = self.run_collect(responder)
+        self.assertEqual(code, 0)
+        self.assertEqual(m.call_count, 3)  # 1検索語 = 1リクエスト（補充検索なし）
+        self.assertTrue(all("NOT+site%3Awikipedia.org" in u for u in sent))
+        text = self.log_text()
+        self.assertIn("https://www.iza.ne.jp/news/ok", text)
+        self.assertIn("https://prtimes.jp/main/html/rd/p/1.html", text)
+        self.assertNotIn("wikipedia.org", text)
+        self.assertNotIn("pressrelease/prtimes", text)
+        self.assertNotIn("NOT site:", text)  # 利用者向けログには元の検索語のみ
+        self.assertIn("- Queries: 自治体 DX", text)
+        seen = json.loads(self.seen.read_text(encoding="utf-8"))
+        self.assertEqual(set(seen), {"https://www.iza.ne.jp/news/ok", "https://prtimes.jp/main/html/rd/p/1.html"})
+        for line in ["results received: 12", "filtered items: 6", "new items: 2", "duplicate items: 4"]:
+            self.assertIn(line, out)
+
+    def test_invalid_exclude_config_fails_without_api_call(self):
+        bad = [
+            "exclude_domains: wikipedia.org\n",
+            "exclude_domains: []\nexclude_url_patterns: x\n",
+            "exclude_domains: ['']\n",
+            "exclude_domains: ['https://wikipedia.org']\n",
+            "exclude_domains: ['wikipedia.org/wiki']\n",
+            "exclude_domains: ['not a domain']\n",
+            "exclude_domains: ['localhost']\n",
+            "exclude_domains: [123]\n",
+            "exclude_domains:\n",
+            "exclude_url_patterns: ['']\n",
+            "exclude_url_patterns: [5]\n",
+            "exclude_domains: [%s]\n" % ", ".join(f"d{i}.example.com" for i in range(40)),  # 検索語長の上限超過
+        ]
+        for extra in bad:
+            self.config.write_text(CONFIG + extra, encoding="utf-8")
+            code, m, _, _ = self.run_collect(lambda *a, **k: self.fail("called"))
+            self.assertEqual(code, 2, extra)
+            m.assert_not_called()
+
+    def test_exclude_settings_are_optional(self):
+        code, m, out, _ = self.run_collect(lambda *a, **k: FakeResponse(api_payload(result("https://a.example.jp/x"))))
+        self.assertEqual(code, 0)
+        self.assertIn("filtered items: 0", out)
+
+
 class Safety(Base):
     def test_missing_api_key_stops_without_api_call(self):
         for env in ({}, {"BRAVE_API_KEY": ""}, {"BRAVE_API_KEY": "  "}):
@@ -257,13 +353,19 @@ class RepoLayout(unittest.TestCase):
     root = Path(__file__).resolve().parent.parent
 
     def test_shipped_config_is_valid(self):
-        themes = collect.load_config(self.root / "config" / "queries.yml")
-        queries = [q for t in themes for q in t.queries]
+        config = collect.load_config(self.root / "config" / "queries.yml")
+        queries = [q for t in config.themes for q in t.queries]
         self.assertEqual(len(queries), 5)
         self.assertEqual(queries[0], '"自治体DX"')  # 引用符付きの検索語がそのまま読み込まれる
         self.assertEqual(queries[1], '"自治体" "デジタル化"')
         self.assertTrue(all('"' in q for q in queries))
         self.assertNotIn("自治体 ChatGPT", queries)
+        self.assertEqual(config.exclude_domains, ["wikipedia.org", "headtopics.com", "topics.smt.docomo.ne.jp"])
+        self.assertEqual(config.exclude_url_patterns,
+                         ["iza.ne.jp/pressrelease/prtimes/", "excite.co.jp/news/article/Prtimes_"])
+        # PR TIMES本体や他の媒体はドメイン単位では除外しない
+        for host in ("prtimes.jp", "www.iza.ne.jp", "www.excite.co.jp", "news.yahoo.co.jp", "note.com"):
+            self.assertFalse(collect.is_excluded(f"https://{host}/a", config.exclude_domains, []), host)
 
     def test_collect_workflow_triggers_and_permissions(self):
         import yaml

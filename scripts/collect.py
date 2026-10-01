@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,6 +32,8 @@ RESULT_COUNT = 10  # 1リクエストあたりの取得件数（固定・20以�
 MAX_RESULT_COUNT = 20
 assert RESULT_COUNT <= MAX_RESULT_COUNT
 FRESHNESS = "pw"  # 直近1週間（毎日実行の新着収集向け）
+MAX_API_QUERY_CHARS = 400  # Brave Search APIの検索語長の上限（400文字・50語）
+MAX_API_QUERY_WORDS = 50
 REQUEST_INTERVAL_SEC = 1.1  # Brave APIのレート制限（無料枠 1 req/sec）対策
 TIMEOUT_SEC = 15
 MAX_RESPONSE_BYTES = 2_000_000
@@ -68,18 +70,26 @@ class Item:
 
 
 @dataclass
+class Config:
+    themes: list[Theme]
+    exclude_domains: list[str] = field(default_factory=list)
+    exclude_url_patterns: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Stats:
     configured_queries: int = 0
     executed_queries: int = 0
     api_requests: int = 0
     failed_queries: int = 0
     results_received: int = 0
+    filtered_items: int = 0
     new_items: int = 0
     duplicate_items: int = 0
 
 
 # ---- 設定 ---------------------------------------------------------------
-def load_config(path: Path) -> list[Theme]:
+def load_config(path: Path) -> Config:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as e:
@@ -110,7 +120,41 @@ def load_config(path: Path) -> list[Theme]:
         raise ConfigError("検索語が0件です")
     if total > MAX_QUERIES:
         raise ConfigError(f"検索語が上限を超えています: {total} 件 (上限 {MAX_QUERIES} 件)")
-    return themes
+
+    domains = _load_exclude_domains(raw.get("exclude_domains", []))
+    patterns = _load_exclude_url_patterns(raw.get("exclude_url_patterns", []))
+    for q in seen_queries:  # 除外演算子を付けた後の検索語がAPIの上限を超えないこと
+        api_q = build_api_query(q, domains)
+        if len(api_q) > MAX_API_QUERY_CHARS or len(api_q.split()) > MAX_API_QUERY_WORDS:
+            raise ConfigError(f"除外ドメインが多すぎてAPIの検索語長の上限を超えます: {q}")
+    return Config(themes=themes, exclude_domains=domains, exclude_url_patterns=patterns)
+
+
+_DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+
+
+def _load_exclude_domains(value: object) -> list[str]:
+    if not isinstance(value, list):
+        raise ConfigError("設定ファイルの形式が不正です: 'exclude_domains' はリストにしてください")
+    domains = []
+    for d in value:
+        if not isinstance(d, str) or not _DOMAIN_RE.match(d.strip().lower()):
+            raise ConfigError(f"exclude_domains の値が不正です（例: example.com。http://やパスは不可）: {d!r}")
+        domains.append(d.strip().lower())
+    return domains
+
+
+def _load_exclude_url_patterns(value: object) -> list[str]:
+    if not isinstance(value, list):
+        raise ConfigError("設定ファイルの形式が不正です: 'exclude_url_patterns' はリストにしてください")
+    patterns = []
+    for p in value:
+        if not isinstance(p, str) or not p.strip():
+            raise ConfigError(f"exclude_url_patterns の値が不正です（空でない文字列）: {p!r}")
+        p = p.strip()
+        host, sep, rest = p.partition("/")  # ホスト部分のみ大文字小文字を区別しない
+        patterns.append(host.lower() + sep + rest)
+    return patterns
 
 
 # ---- URL・テキスト整形 ---------------------------------------------------
@@ -151,6 +195,15 @@ def clean_text(text: object) -> str:
     return " ".join(text.split()).lstrip("#> ").strip()
 
 
+def is_excluded(url: str, domains: list[str], patterns: list[str]) -> bool:
+    """正規化済みURLが除外ドメイン（サブドメイン含む・境界考慮）または除外URLパターンに該当するか。"""
+    host = domain_of(url).lower()
+    if any(host == d or host.endswith("." + d) for d in domains):
+        return True
+    target = url.split("://", 1)[-1]  # スキームを除いた host/path?query に対する部分一致
+    return any(p in target for p in patterns)
+
+
 def domain_of(url: str) -> str:
     return urllib.parse.urlsplit(url).hostname or ""
 
@@ -166,10 +219,15 @@ def parse_published(value: object) -> str | None:
 
 
 # ---- Brave Search API ----------------------------------------------------
-def build_request(query: str, api_key: str) -> urllib.request.Request:
+def build_api_query(query: str, exclude_domains: list[str] = ()) -> str:
+    """APIへ送る検索語。除外ドメインを NOT site: で付与する（ログ・記録には元の検索語を使う）。"""
+    return " ".join([query, *(f"NOT site:{d}" for d in exclude_domains)])
+
+
+def build_request(query: str, api_key: str, exclude_domains: list[str] = ()) -> urllib.request.Request:
     params = urllib.parse.urlencode(
         {
-            "q": query,
+            "q": build_api_query(query, exclude_domains),
             "count": RESULT_COUNT,
             "country": "JP",
             "search_lang": "ja",
@@ -186,9 +244,9 @@ def build_request(query: str, api_key: str) -> urllib.request.Request:
     )
 
 
-def search(query: str, api_key: str) -> list[dict]:
+def search(query: str, api_key: str, exclude_domains: list[str] = ()) -> list[dict]:
     """1回だけAPIを呼ぶ。失敗時は例外（本文は含めない）。"""
-    with urllib.request.urlopen(build_request(query, api_key), timeout=TIMEOUT_SEC) as resp:
+    with urllib.request.urlopen(build_request(query, api_key, exclude_domains), timeout=TIMEOUT_SEC) as resp:
         body = resp.read(MAX_RESPONSE_BYTES)
     data = json.loads(body)
     results = ((data.get("web") or {}).get("results")) if isinstance(data, dict) else None
@@ -280,12 +338,13 @@ def write_log(logs_dir: Path, today: str, items: list[Item]) -> Path:
 
 # ---- メイン処理 ----------------------------------------------------------
 def collect(
-    themes: list[Theme],
+    config: Config,
     api_key: str,
     seen: dict[str, dict],
     today: str,
     sleep=time.sleep,
 ) -> tuple[list[Item], Stats]:
+    themes = config.themes
     stats = Stats(configured_queries=sum(len(t.queries) for t in themes))
     if stats.configured_queries > MAX_QUERIES:  # load_configとは独立した最終防衛線
         raise ConfigError(f"検索語が上限を超えています: {stats.configured_queries} 件 (上限 {MAX_QUERIES} 件)")
@@ -300,7 +359,7 @@ def collect(
             stats.executed_queries += 1
             stats.api_requests += 1
             try:
-                results = search(query, api_key)
+                results = search(query, api_key, config.exclude_domains)
             except Exception as e:  # 1件の失敗で全体を止めない。本文・ヘッダは出力しない。
                 stats.failed_queries += 1
                 print(f"::warning::search failed: query='{query}' error={describe_error(e)}")
@@ -311,6 +370,9 @@ def collect(
                 if not url:
                     continue
                 stats.results_received += 1
+                if is_excluded(url, config.exclude_domains, config.exclude_url_patterns):
+                    stats.filtered_items += 1  # 後段フィルタ。ログにもseen.jsonにも残さない
+                    continue
                 if url in seen:
                     stats.duplicate_items += 1
                 elif url in new_items:
@@ -337,6 +399,7 @@ def print_stats(s: Stats) -> None:
     print(f"API requests: {s.api_requests}")
     print(f"failed queries: {s.failed_queries}")
     print(f"results received: {s.results_received}")
+    print(f"filtered items: {s.filtered_items}")
     print(f"new items: {s.new_items}")
     print(f"duplicate items: {s.duplicate_items}")
 
@@ -358,9 +421,9 @@ def run(
               "GitHub の Settings → Secrets and variables → Actions で登録してください。", file=sys.stderr)
         return 2
     try:
-        themes = load_config(config_path)
+        config = load_config(config_path)
         seen = load_seen(seen_path)
-        items, stats = collect(themes, api_key, seen, today, sleep=sleep)
+        items, stats = collect(config, api_key, seen, today, sleep=sleep)
     except ConfigError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
