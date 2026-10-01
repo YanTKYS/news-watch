@@ -55,13 +55,15 @@ class Base(unittest.TestCase):
         self.seen = d / "data" / "seen.json"
         self.logs = d / "logs"
         self.months = d / "data" / "months.json"
+        self.rejected = d / "data" / "jev-rejected.json"
 
     def run_collect(self, responder, today="2026-09-30", env=None, config=None):
         env = {"BRAVE_API_KEY": SECRET} if env is None else env
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(collect.urllib.request, "urlopen", side_effect=responder) as m, \
                 redirect_stdout(out), redirect_stderr(err):
-            code = collect.run(config or self.config, self.seen, self.logs, self.months, today, env, sleep=lambda s: None)
+            code = collect.run(config or self.config, self.seen, self.logs, self.months, self.rejected,
+                               today, env, sleep=lambda s: None)
         return code, m, out.getvalue(), err.getvalue()
 
     def log_text(self, ym="2026/2026-09.md"):
@@ -456,6 +458,7 @@ class JevFilter(Base):
         self.assertEqual(req.get_header("Authorization"), f"Bearer {JEV_SECRET}")
         body = json.loads(req.data)
         self.assertEqual(body["model"], collect.JEV_MODEL)
+        self.assertEqual(collect.JEV_MODEL, "jev-latest")  # TypeSafe直API向け（typesafe/ 接頭辞はOpenRouter用）
         self.assertEqual(list(body["questions"]), ["relevant"])  # 1記事につきNoul 1問
         self.assertEqual(body["questions"]["relevant"]["type"], "noul")
         self.assertEqual(body["state"], "Title: T\nSource: a.example.jp\nDescription: 説明文\nSearch queries: 自治体 DX / 自治体 生成AI / 市役所 生成AI")
@@ -527,6 +530,99 @@ class JevFilter(Base):
         self.assertEqual(len(self.brave_calls), 3)  # 1検索語=1リクエスト
         self.assertTrue(all(u.startswith(collect.API_ENDPOINT) for u in self.brave_calls))
 
+    # --- 非関連キャッシュ（jev-rejected.json, 7日） ---
+    def rejected_value(self):
+        return json.loads(self.rejected.read_text(encoding="utf-8"))
+
+    def write_rejected(self, mapping):
+        self.rejected.parent.mkdir(parents=True, exist_ok=True)
+        self.rejected.write_text(json.dumps({u: {"rejected_at": d} for u, d in mapping.items()}), encoding="utf-8")
+
+    def test_irrelevant_is_cached_not_seen_and_not_rejudged_next_day(self):
+        self.brave_results = lambda q: [result("https://bad.example.jp/a", "bad"), result("https://ok.example.jp/a", "ok")]
+        self.jev_scores = {"bad": 0.0}
+        self.go(today="2026-10-01")
+        self.assertEqual(self.rejected_value(), {"https://bad.example.jp/a": {"rejected_at": "2026-10-01"}})
+        self.assertEqual(self.saved_urls(), {"https://ok.example.jp/a"})  # seen.jsonには入れない
+        self.assertEqual(len(self.jev_reqs), 2)
+        self.jev_reqs.clear()
+        _, _, out, _ = self.go(today="2026-10-02")
+        self.assertEqual(self.jev_reqs, [])  # 非関連はキャッシュ、関連はseenで、Jevは呼ばれない
+        self.assertIn("Jev cached rejects (not re-judged): 1", out)
+        self.assertIn("Jev requests: 0", out)
+        self.assertNotIn("bad.example.jp", self.log_text("2026/2026-10.md"))
+
+    def test_cache_ttl_boundary(self):
+        self.brave_results = lambda q: [result("https://bad.example.jp/a", "bad")]
+        self.jev_scores = {"bad": 0.0}
+        self.write_rejected({"https://bad.example.jp/a": "2026-10-01"})
+        self.go(today="2026-10-08")  # ちょうど7日 → キャッシュ有効
+        self.assertEqual(self.jev_reqs, [])
+        self.go(today="2026-10-09")  # 8日 → 期限切れ。再判定される
+        self.assertEqual(len(self.jev_reqs), 1)
+        self.assertEqual(self.rejected_value()["https://bad.example.jp/a"], {"rejected_at": "2026-10-09"})
+
+    def test_expired_cache_can_turn_relevant_and_gets_saved(self):
+        self.brave_results = lambda q: [result("https://x.example.jp/a", "x")]
+        self.write_rejected({"https://x.example.jp/a": "2026-09-01"})
+        self.go(today="2026-10-01")
+        self.assertEqual(self.saved_urls(), {"https://x.example.jp/a"})
+
+    def test_cache_hit_before_merge_means_no_jev_and_no_save(self):
+        self.config.write_text('themes:\n  - name: t\n    queries: [q1, q2]\n', encoding="utf-8")
+        self.brave_results = lambda q: [result("https://bad.example.jp/a", "bad"), result("https://new.example.jp/a", "new")]
+        self.write_rejected({"https://bad.example.jp/a": "2026-10-01"})
+        _, _, out, _ = self.go(today="2026-10-02")
+        self.assertEqual(len(self.jev_reqs), 1)  # newのみ（2クエリ分は統合）
+        self.assertIn("Jev candidates: 1", out)
+        self.assertIn("Jev cached rejects (not re-judged): 1", out)  # ユニークURL数
+        self.assertNotIn("bad.example.jp", self.log_text("2026/2026-10.md"))
+        self.assertNotIn("https://bad.example.jp/a", self.saved_urls())
+
+    def test_cache_written_only_when_new_rejections_and_pruned_then(self):
+        self.brave_results = lambda q: [result("https://ok.example.jp/a", "ok")]
+        self.write_rejected({"https://old.example.jp/a": "2026-09-01"})
+        before = self.rejected.read_text(encoding="utf-8")
+        self.go(today="2026-10-01")  # 新たな非関連なし → 書き換えない（期限切れ掃除もしない）
+        self.assertEqual(self.rejected.read_text(encoding="utf-8"), before)
+        self.brave_results = lambda q: [result("https://bad.example.jp/a", "bad")]
+        self.jev_scores = {"bad": 0.0}
+        self.go(today="2026-10-02")  # 新たな非関連あり → 書き込み、期限切れは掃除
+        self.assertEqual(set(self.rejected_value()), {"https://bad.example.jp/a"})
+
+    def test_failures_and_fail_open_never_enter_cache(self):
+        self.brave_results = lambda q: [result("https://a.example.jp/x", "a")]
+        self.jev_behavior = lambda req, n: (_ for _ in ()).throw(urllib.error.URLError("down"))
+        self.go()
+        self.assertFalse(self.rejected.exists())
+        self.jev_behavior = None
+        self.go(jev_key=None, today="2026-10-02")
+        self.assertFalse(self.rejected.exists())
+
+    def test_cache_not_applied_without_jev_key(self):
+        self.brave_results = lambda q: [result("https://bad.example.jp/a", "bad")]
+        self.write_rejected({"https://bad.example.jp/a": "2026-10-01"})
+        self.go(jev_key=None, today="2026-10-02")
+        self.assertEqual(self.jev_reqs, [])
+        self.assertIn("https://bad.example.jp/a", self.log_text("2026/2026-10.md"))  # Jev無効時は従来どおり保存
+
+    def test_corrupt_or_malformed_cache_is_ignored(self):
+        self.brave_results = lambda q: [result("https://a.example.jp/x", "a")]
+        for content in ("{broken", "[]", '{"https://a.example.jp/x": {"rejected_at": "yesterday"}}',
+                        '{"https://a.example.jp/x": "2026-10-01"}'):
+            with self.subTest(content):
+                self.rejected.parent.mkdir(parents=True, exist_ok=True)
+                self.rejected.write_text(content, encoding="utf-8")
+                self.jev_reqs.clear()
+                code, _, _, _ = self.go(today="2026-10-02")
+                self.assertEqual(code, 0)
+                self.assertEqual(len(self.jev_reqs), 1)  # キャッシュは無効扱い
+                for p in (self.logs, self.seen):
+                    if p.is_dir():
+                        import shutil; shutil.rmtree(p)
+                    elif p.exists():
+                        p.unlink()
+
     def test_workflow_passes_jev_secret_only_to_collect_step(self):
         import yaml
         root = Path(__file__).resolve().parent.parent
@@ -534,6 +630,10 @@ class JevFilter(Base):
         steps = wf["jobs"]["collect"]["steps"]
         with_jev = [st for st in steps if "JEV_API_KEY" in st.get("env", {})]
         self.assertEqual([st["name"] for st in with_jev], ["Collect"])
+        commit = next(st for st in steps if st.get("name", "").startswith("Commit"))
+        self.assertIn("data/jev-rejected.json", commit["run"])
+        # 存在しないパスを git add するとcommit stepが失敗するため、初期ファイルを同梱している
+        self.assertTrue((root / "data" / "jev-rejected.json").exists())
         self.assertEqual(with_jev[0]["env"]["JEV_API_KEY"], "${{ secrets.JEV_API_KEY }}")
         self.assertEqual(wf["permissions"], {"contents": "write"})
         self.assertNotIn("secrets", (root / ".github/workflows/test.yml").read_text(encoding="utf-8"))
