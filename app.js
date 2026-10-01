@@ -113,6 +113,7 @@ function renderMonth(ym, days, order) {
 
 async function showMonth(ym) {
   const token = ++loadToken;
+  current = null; // 読み込み中・失敗時に旧月を並び順変更で再描画しない
   content.replaceChildren();
   setStatus("読み込み中...");
   let text;
