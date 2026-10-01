@@ -4,9 +4,12 @@
 
 const MONTH_RE = /^\d{4}-\d{2}$/;
 const select = document.getElementById("month-select");
+const orderSelect = document.getElementById("order-select");
 const statusEl = document.getElementById("status");
 const content = document.getElementById("content");
 let loadToken = 0; // 連続切替時に古い応答で上書きしない
+let sortOrder = "desc"; // "desc"=新しい順 / "asc"=古い順（月を切り替えても維持。永続化はしない）
+let current = null; // 表示中の月 { ym, days }。並び順変更時の再描画に使う
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -67,8 +70,20 @@ function renderCard(item) {
   return card;
 }
 
-function renderMonth(ym, days) {
-  const total = days.reduce((n, d) => n + d.themes.reduce((m, t) => m + t.items.length, 0), 0);
+// 日付順に並べ替えた新しい配列を返す（元の配列は変更しない）。
+function sortDays(days, order) {
+  const sorted = [...days].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return order === "asc" ? sorted : sorted.reverse();
+}
+
+function countItems(themes) {
+  return themes.reduce((n, t) => n + t.items.length, 0);
+}
+
+function renderMonth(ym, days, order) {
+  const total = days.reduce((n, d) => n + countItems(d.themes), 0);
+  // 初期展開するのは、並び順に関係なくその月の最新日のみ
+  const latest = days.reduce((max, d) => (d.date > max ? d.date : max), "");
   const frag = document.createDocumentFragment();
 
   const head = el("div", "month-head");
@@ -76,9 +91,13 @@ function renderMonth(ym, days) {
   head.appendChild(el("span", "count", `${total}件`));
   frag.appendChild(head);
 
-  for (const day of [...days].reverse()) { // 新しい日付を上に
-    const section = el("section", "day");
-    section.appendChild(el("h3", "day-title", dateLabel(day.date)));
+  for (const day of sortDays(days, order)) {
+    const section = el("details", "day");
+    section.open = day.date === latest;
+    const summary = el("summary", "day-summary");
+    summary.appendChild(el("span", "day-title", dateLabel(day.date)));
+    summary.appendChild(el("span", "count", `${countItems(day.themes)}件`));
+    section.appendChild(summary);
     for (const theme of day.themes) {
       const block = el("div", "theme");
       const h = el("h4", "theme-title", theme.name);
@@ -116,7 +135,8 @@ async function showMonth(ym) {
     return;
   }
   setStatus("");
-  renderMonth(ym, days);
+  current = { ym, days };
+  renderMonth(ym, days, sortOrder);
 }
 
 async function init() {
@@ -139,7 +159,12 @@ async function init() {
     select.appendChild(opt);
   }
   select.disabled = false;
+  orderSelect.disabled = false;
   select.addEventListener("change", () => showMonth(select.value));
+  orderSelect.addEventListener("change", () => {
+    sortOrder = orderSelect.value === "asc" ? "asc" : "desc";
+    if (current) renderMonth(current.ym, current.days, sortOrder); // 再取得せず再描画（開閉は最新日のみ展開に戻る）
+  });
   showMonth(months[0]); // months.json は新しい順。先頭=最新月
 }
 

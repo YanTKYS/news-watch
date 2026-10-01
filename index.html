@@ -13,10 +13,19 @@
     <div class="wrap">
       <h1>news-watch</h1>
       <p class="lead">自治体DX・自治体の生成AI活用に関する新着情報</p>
-      <label class="month-picker">
-        <span class="visually-hidden">表示する月</span>
-        <select id="month-select" disabled></select>
-      </label>
+      <div class="controls">
+        <label>
+          <span class="visually-hidden">表示する月</span>
+          <select id="month-select" disabled></select>
+        </label>
+        <label class="order-picker">
+          <span>並び順</span>
+          <select id="order-select" disabled>
+            <option value="desc" selected>新しい順</option>
+            <option value="asc">古い順</option>
+          </select>
+        </label>
+      </div>
     </div>
   </header>
   <main class="wrap">
