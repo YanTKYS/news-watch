@@ -9,7 +9,8 @@ Markdownの時系列ログとして蓄積するツールです。検索結果の
 1. [Brave Search API](https://brave.com/search/api/) でAPIキーを取得します。
 2. GitHubのリポジトリで **Settings → Secrets and variables → Actions** を開き、
    Repository secret として `BRAVE_API_KEY` を登録します（値はAPIキー。コード・ファイルには書かないでください）。
-3. **Actions** タブでワークフローを有効化します。
+3. （任意）関連性フィルタを使う場合は、同じ手順で Repository secret `JEV_API_KEY`（Jev APIのキー）も登録します。
+4. **Actions** タブでワークフローを有効化します。
 
 ## 実行
 
@@ -45,6 +46,18 @@ themes:
 検索語は合計10件までです。超えると、APIを呼ばずにエラーで停止します。
 1検索語につきAPIリクエストは1回（上位10件、リトライ・ページングなし）なので、
 1回の実行で最大でも10リクエストです。
+
+## Jevによる関連性フィルタ
+
+Brave Searchで取得した新規候補のうち、除外設定と重複排除を通過したURLだけをJev（System One）で
+「日本の自治体DX・生成AI活用に関係する記事か」判定します。Brave検索結果のタイトル・説明文・検索語だけを送り、
+記事本文は取得しません。
+明確に非関連（Yes確率 0.30 未満）と判断した記事だけを除外し、除外した記事は `seen.json` にも記録しません。
+`JEV_API_KEY` 未設定・API障害・利用上限到達時は記事を除外せず保存し、収集を継続します（リトライなし）。
+Jevへの問い合わせは1回の実行で最大20件です。非関連と判定したURLは `data/jev-rejected.json` に7日間記録し、
+その間は再判定しません（`seen.json` には記録しません）。
+
+必要なSecret: `BRAVE_API_KEY`（必須）、`JEV_API_KEY`（任意）
 
 ## 出力
 

@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -38,6 +38,22 @@ REQUEST_INTERVAL_SEC = 1.1  # Brave APIのレート制限（無料枠 1 req/sec�
 TIMEOUT_SEC = 15
 MAX_RESPONSE_BYTES = 2_000_000
 USER_AGENT = "news-watch/1.0 (+https://github.com/YanTKYS/news-watch)"
+
+# ---- Jev（関連性フィルタ）。追加フィルタであり、失敗時は記事を残す（fail-open） -------
+JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"  # Jev System One API
+JEV_MODEL = "jev-latest"  # TypeSafe直API向けの名前（固定したい場合は "jev-1.13.0"）
+JEV_QUESTION_KEY = "relevant"
+JEV_INSTRUCTIONS = (
+    "この情報は、日本の自治体・地方公共団体におけるDX、デジタル化、"
+    "生成AI、AI活用、行政業務改善についての具体的なニュース、事例、"
+    "制度、調査、実証、導入、サービス、取組に実質的に関係しているか。"
+    "単に「DX」「AI」「自治体」等の単語が偶然含まれるだけの記事は false とする。"
+)
+MAX_JEV_REQUESTS = 20  # 1回の実行でのJev API呼び出しのハードリミット（超過分は判定せず保存）
+JEV_TIMEOUT_SEC = 15
+JEV_RELEVANCE_THRESHOLD = 0.30  # noul(Yes確率) がこの値未満の場合のみ非関連として除外（Recall優先）
+MAX_JEV_RESPONSE_BYTES = 100_000
+JEV_REJECT_TTL_DAYS = 7  # 非関連と判定したURLを再判定しない期間（Braveの freshness=pw に合わせる）
 
 JST = timezone(timedelta(hours=9))
 
@@ -86,6 +102,12 @@ class Stats:
     filtered_items: int = 0
     new_items: int = 0
     duplicate_items: int = 0
+    jev_candidates: int = 0
+    jev_requests: int = 0
+    jev_relevant: int = 0
+    jev_irrelevant: int = 0
+    jev_fallback: int = 0  # APIキー未設定・失敗・上限到達などで判定せず保存した件数
+    jev_cached_rejects: int = 0  # 非関連キャッシュにより、Jevを呼ばず除外したユニークURL数
 
 
 # ---- 設定 ---------------------------------------------------------------
@@ -261,6 +283,112 @@ def describe_error(e: Exception) -> str:
     return type(e).__name__
 
 
+# ---- Jev関連性判定 -------------------------------------------------------
+def build_jev_request(item: "Item", api_key: str) -> urllib.request.Request:
+    """Braveから取得済みの情報のみを state に渡す（本文取得・APIキーは含めない）。"""
+    lines = [f"Title: {item.title}", f"Source: {domain_of(item.url)}"]
+    if item.description:
+        lines.append(f"Description: {item.description}")
+    lines.append(f"Search queries: {' / '.join(item.queries)}")
+    body = {
+        "model": JEV_MODEL,
+        "state": "\n".join(lines),
+        "questions": {JEV_QUESTION_KEY: {"type": "noul", "instructions": JEV_INSTRUCTIONS}},
+    }
+    return urllib.request.Request(
+        JEV_ENDPOINT,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+
+
+def jev_relevance(item: "Item", api_key: str) -> float:
+    """1記事につき1回だけJevへ問い合わせ、noul(Yes確率)を返す。失敗・不正な応答は例外（リトライしない）。"""
+    with urllib.request.urlopen(build_jev_request(item, api_key), timeout=JEV_TIMEOUT_SEC) as resp:
+        data = json.loads(resp.read(MAX_JEV_RESPONSE_BYTES))
+    answer = data["answers"][JEV_QUESTION_KEY]
+    value = answer["noul"]
+    if answer.get("type") != "noul" or isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("unexpected answer")
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("noul out of range")
+    return float(value)
+
+
+def is_recently_rejected(rejected: dict[str, dict], url: str, today: str) -> bool:
+    """非関連キャッシュ（jev-rejected.json）に、TTL以内で登録されているURLか。"""
+    entry = rejected.get(url)
+    try:
+        age = (date.fromisoformat(today) - date.fromisoformat(entry["rejected_at"])).days
+    except (TypeError, KeyError, ValueError):
+        return False
+    return age <= JEV_REJECT_TTL_DAYS
+
+
+def load_rejected(path: Path) -> dict[str, dict]:
+    """キャッシュなので、壊れていても収集は止めず空として扱う（Jev呼び出しが増えるだけ・上限あり）。"""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError) as e:
+        print(f"::warning::jev-rejected cache ignored: error={type(e).__name__}")
+        return {}
+    return {u: v for u, v in data.items() if isinstance(v, dict)}
+
+
+def update_rejected(path: Path, rejected: dict[str, dict], new_urls: list[str], today: str) -> bool:
+    """新たな非関連URLがある場合のみ書き込む（期限切れの掃除もこのとき行う）。"""
+    if not new_urls:
+        return False
+    for url in new_urls:
+        rejected[url] = {"rejected_at": today}
+    kept = {u: v for u, v in rejected.items() if is_recently_rejected({u: v}, u, today)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(kept, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return True
+
+
+def filter_by_relevance(items: list["Item"], jev_api_key: str, stats: Stats) -> tuple[list["Item"], list[str]]:
+    """既存フィルタ・既知URL除外・同一実行内の統合を終えたユニーク候補だけをJevで判定する。
+
+    明確に非関連（noul < 閾値）と正常に判定された記事のみ除外し、それ以外は保存する（fail-open）。
+    戻り値は (保存する記事, 非関連と判定したURL)。
+    """
+    stats.jev_candidates = len(items)
+    kept: list[Item] = []
+    rejected_urls: list[str] = []
+    for item in items:
+        if not jev_api_key or stats.jev_requests >= MAX_JEV_REQUESTS:
+            kept.append(item)
+            stats.jev_fallback += 1
+            continue
+        stats.jev_requests += 1
+        try:
+            score = jev_relevance(item, jev_api_key)
+        except Exception as e:  # リトライしない。本文・ヘッダ・キーは出力しない。
+            kept.append(item)
+            stats.jev_fallback += 1
+            print(f"::warning::jev failed (kept): error={describe_error(e)}")
+            continue
+        if score < JEV_RELEVANCE_THRESHOLD:
+            stats.jev_irrelevant += 1
+            rejected_urls.append(item.url)
+        else:
+            stats.jev_relevant += 1
+            kept.append(item)
+    stats.new_items = len(kept)
+    return kept, rejected_urls
+
+
 # ---- 永続化 --------------------------------------------------------------
 def load_seen(path: Path) -> dict[str, dict]:
     if not path.exists():
@@ -366,12 +494,15 @@ def collect(
     seen: dict[str, dict],
     today: str,
     sleep=time.sleep,
+    rejected: dict[str, dict] | None = None,
 ) -> tuple[list[Item], Stats]:
     themes = config.themes
     stats = Stats(configured_queries=sum(len(t.queries) for t in themes))
     if stats.configured_queries > MAX_QUERIES:  # load_configとは独立した最終防衛線
         raise ConfigError(f"検索語が上限を超えています: {stats.configured_queries} 件 (上限 {MAX_QUERIES} 件)")
 
+    rejected = rejected or {}  # Jev有効時のみ渡される非関連キャッシュ
+    cached_rejects: set[str] = set()
     new_items: dict[str, Item] = {}
     first_request = True
     for theme in themes:
@@ -398,6 +529,8 @@ def collect(
                     continue
                 if url in seen:
                     stats.duplicate_items += 1
+                elif is_recently_rejected(rejected, url, today):
+                    cached_rejects.add(url)  # 直近にJevが非関連と判定済み。再判定せず除外
                 elif url in new_items:
                     stats.duplicate_items += 1
                     if query not in new_items[url].queries:
@@ -412,6 +545,7 @@ def collect(
                         published=parse_published(r.get("page_age")),
                     )
 
+    stats.jev_cached_rejects = len(cached_rejects)
     stats.new_items = len(new_items)
     return list(new_items.values()), stats
 
@@ -423,8 +557,14 @@ def print_stats(s: Stats) -> None:
     print(f"failed queries: {s.failed_queries}")
     print(f"results received: {s.results_received}")
     print(f"filtered items: {s.filtered_items}")
-    print(f"new items: {s.new_items}")
     print(f"duplicate items: {s.duplicate_items}")
+    print(f"Jev candidates: {s.jev_candidates}")
+    print(f"Jev requests: {s.jev_requests}")
+    print(f"Jev relevant: {s.jev_relevant}")
+    print(f"Jev irrelevant: {s.jev_irrelevant}")
+    print(f"Jev cached rejects (not re-judged): {s.jev_cached_rejects}")
+    print(f"Jev skipped/fallback: {s.jev_fallback}")
+    print(f"new items: {s.new_items}")
 
 
 def run(
@@ -432,6 +572,7 @@ def run(
     seen_path: Path = ROOT / "data" / "seen.json",
     logs_dir: Path = ROOT / "logs",
     months_path: Path = ROOT / "data" / "months.json",
+    rejected_path: Path = ROOT / "data" / "jev-rejected.json",
     today: str | None = None,
     env: dict | None = None,
     sleep=time.sleep,
@@ -447,10 +588,18 @@ def run(
     try:
         config = load_config(config_path)
         seen = load_seen(seen_path)
-        items, stats = collect(config, api_key, seen, today, sleep=sleep)
+        jev_api_key = (env.get("JEV_API_KEY") or "").strip()
+        # Jev無効時は非関連キャッシュも使わない（従来どおり全件保存）
+        rejected = load_rejected(rejected_path) if jev_api_key else {}
+        items, stats = collect(config, api_key, seen, today, sleep=sleep, rejected=rejected)
     except ConfigError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
+
+    if not jev_api_key:  # Jevは追加フィルタ。未設定でも収集は継続する
+        print("::warning::JEV_API_KEY is not configured; relevance filtering is skipped.")
+    items, new_rejects = filter_by_relevance(items, jev_api_key, stats)
+    update_rejected(rejected_path, rejected, new_rejects, today)
 
     if items:
         write_log(logs_dir, today, items)  # ログ→seenの順（途中失敗時に記事を取りこぼさない）
