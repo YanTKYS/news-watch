@@ -5,6 +5,8 @@
 - APIキーは環境変数 BRAVE_API_KEY からのみ取得する（出力・保存しない）。
 - 1検索語につきAPIリクエストは1回（ページング・リトライなし）。
 - 検索結果のtitle/url/descriptionのみを利用する（本文取得なし）。
+- 同一話題の重複候補（URLが異なる転載・再配信など）はタイトル類似度で検出し、Actionsログに出すだけ。
+  保存可否には影響させない（検証フェーズ。詳細は topic_dedup.py）。
 """
 from __future__ import annotations
 
@@ -22,6 +24,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
+
+import topic_dedup
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -550,6 +554,25 @@ def collect(
     return list(new_items.values()), stats
 
 
+def detect_topic_duplicates(items: list[Item], logs_dir: Path, today: str) -> "topic_dedup.TopicResult | None":
+    """保存候補と、直近の保存済み記事（月次ログ）・保存候補同士を比較する。観測のみで、失敗しても収集は止めない。
+
+    ログへの書き込み前に呼ぶこと（書き込み後だと自分自身と比較してしまう）。外部APIは使わない。
+    """
+    try:
+        past = topic_dedup.load_recent_articles(logs_dir, today)
+        new = [topic_dedup.Article(url=i.url, title=i.title) for i in items]
+        return topic_dedup.detect_topic_duplicates(new, past)
+    except Exception as e:  # 本文・パスは出力しない
+        print(f"::warning::topic duplicate detection skipped: error={type(e).__name__}")
+        return None
+
+
+def print_topic_result(result: "topic_dedup.TopicResult | None") -> None:
+    if result is not None:
+        print("\n".join(topic_dedup.format_report(result)))
+
+
 def print_stats(s: Stats) -> None:
     print(f"configured queries: {s.configured_queries}")
     print(f"executed queries: {s.executed_queries}")
@@ -601,6 +624,8 @@ def run(
     items, new_rejects = filter_by_relevance(items, jev_api_key, stats)
     update_rejected(rejected_path, rejected, new_rejects, today)
 
+    topic_result = detect_topic_duplicates(items, logs_dir, today)  # 検証用の観測のみ。items・保存処理は変更しない
+
     if items:
         write_log(logs_dir, today, items)  # ログ→seenの順（途中失敗時に記事を取りこぼさない）
         for item in items:
@@ -609,6 +634,7 @@ def run(
         update_months(months_path, logs_dir)  # 閲覧UI用。収集の成否には影響させない軽量処理
 
     print_stats(stats)
+    print_topic_result(topic_result)
     if stats.failed_queries == stats.executed_queries:
         print("ERROR: すべての検索が失敗しました。", file=sys.stderr)
         return 1

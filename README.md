@@ -59,6 +59,14 @@ Jevへの問い合わせは1回の実行で最大20件です。非関連と判�
 
 必要なSecret: `BRAVE_API_KEY`（必須）、`JEV_API_KEY`（任意）
 
+## 同一話題の重複候補（検証中）
+
+URLが異なっていても同じ発表を扱っている記事（転載・再配信）を、タイトルの類似度だけで検出し、
+Actionsログに `Topic duplicate candidates` / `Topic duplicate pairs` として表示します（`scripts/topic_dedup.py`）。
+新規保存候補を、直近7日間（取得日 Retrieved 基準）の `logs/` の記事と、新規候補同士で比較します。
+**現在は観測のみで、記事は従来どおりすべて保存します**（`seen.json`・ログ形式・API呼び出し数は変わりません）。
+閾値は `topic_dedup.py` の `TOPIC_*` 定数で調整できます。見出しが書き換えられた記事など、曖昧な組み合わせは候補にしません。
+
 ## 出力
 
 `logs/YYYY/YYYY-MM.md`（月単位）に、日付 → テーマの順で記事を追記します。

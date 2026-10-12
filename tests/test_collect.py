@@ -10,6 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import collect  # noqa: E402
+import topic_dedup  # noqa: E402
 
 SECRET = "dummy-key-for-tests"  # 実キーではないテスト用ダミー値
 
@@ -757,6 +758,327 @@ class RepoLayout(unittest.TestCase):
             wf = yaml.safe_load(p.read_text(encoding="utf-8"))
             triggers = wf.get(True, wf.get("on"))
             self.assertNotIn("pull_request_target", triggers, p.name)
+
+
+# ---- 同一話題の重複候補（検証フェーズ・観測のみ） -----------------------------------
+QOMMONS_ASCII = ("行政向け生成AI「QommonsAI」、J-LISフェア2026でエージェント版と行政専用AIアプリストア「Qommons ONE」を披露 "
+                 "- 自治体の定型業務を、職員の承認の基でAIが最後まで進める : - ASCII STARTUP")
+QOMMONS_PRTIMES = ("行政向け生成AI「QommonsAI」、J-LISフェア2026でエージェント版と行政専用AIアプリストア「Qommons ONE」を披露 "
+                   "— 自治体の定型業務を、職員の承認の基でAIが最後まで進める | Polimill株式会社のプレスリリース")
+QOMMONS_CODECAMP = ("行政向け生成AI「QommonsAI」、J-LISフェア2026でエージェント版と行政専用AIアプリストア「Qommons ONE」を披露 "
+                    "— 自治体の定型業務を、職員の承認の基でAIが最後まで進める")
+QOMMONS_GIFU = "QommonsAI活用研修を岐阜県庁で実施 - 「生成AIを、個人の道具から、組織の知恵へ」庁内文書を活かす本格活用の一歩 : - ASCII STARTUP"
+NTT_CODECAMP = "自治体における脱炭素化推進に向け、生成AIを活用した新たなコンサルティング手法（地 方公共団体実行計画区域施策編）を確立"
+NTT_PRTIMES = ("自治体における脱炭素化推進に向け、生成AIを活用した新たなコンサルティング手法（地方公共団体実行計画区域施策編）を確立 "
+               "| NTT西日本株式会社のプレスリリース")
+NTT_DEMPA = "NTT西、生成AIで自治体の脱炭素計画策定を支援 自治体職員の負担軽減へ | 電波新聞デジタル"
+
+
+def art(title, url=None, retrieved=""):
+    return topic_dedup.Article(url=url or f"https://{abs(hash(title)) % 10**8}.example.jp/a", title=title, retrieved=retrieved)
+
+
+def scored(a, b):
+    return topic_dedup.compare(art(a, "https://a.example.jp/1"), art(b, "https://b.example.jp/2"))
+
+
+class TopicSimilarity(unittest.TestCase):
+    def assertDuplicate(self, a, b):
+        score = scored(a, b)
+        self.assertIsNotNone(score, (a, b))
+        self.assertGreaterEqual(score, topic_dedup.TOPIC_SIMILARITY_THRESHOLD, (a, b))
+
+    def assertNotDuplicate(self, a, b):
+        score = scored(a, b)
+        self.assertTrue(score is None or score < topic_dedup.TOPIC_SIMILARITY_THRESHOLD, (a, b, score))
+
+    def test_same_title_different_url(self):
+        self.assertEqual(topic_dedup.compare(art("生成AIチャットボットを全庁で導入", "https://a.example.jp/1"),
+                                             art("生成AIチャットボットを全庁で導入", "https://b.example.jp/2")), 1.0)
+
+    def test_same_url_is_not_a_pair(self):
+        self.assertIsNone(topic_dedup.compare(art("生成AIチャットボットを全庁で導入", "https://a.example.jp/1"),
+                                              art("生成AIチャットボットを全庁で導入", "https://a.example.jp/1")))
+
+    def test_reprint_with_changed_media_name_and_symbols(self):
+        # 実ログ: QommonsAIの同一発表（ASCII STARTUP / PR TIMES / CodeCamp Trends）
+        self.assertDuplicate(QOMMONS_ASCII, QOMMONS_PRTIMES)
+        self.assertDuplicate(QOMMONS_ASCII, QOMMONS_CODECAMP)
+        self.assertDuplicate(QOMMONS_PRTIMES, QOMMONS_CODECAMP)
+        # 実ログ: NTT西日本のプレスリリース（PR TIMES / CodeCamp Trends。後者は「地 方」と空白混じり）
+        self.assertDuplicate(NTT_CODECAMP, NTT_PRTIMES)
+        # 実ログ: 同一記事の配信先違い
+        base = "グーグル、観光や行政支援など 全国9自治体の生成AI事例を公開"
+        self.assertDuplicate(base + " - Impress Watch", base + " | チバテレ＋プラス")
+        self.assertDuplicate(base + " - Impress Watch", base + "（Impress Watch）｜ｄメニューニュース")
+
+    def test_japanese_notation_variants(self):
+        self.assertDuplicate("株式会社ＴＫＣ、自治体ＤＸ推進フェアへ出展 | 株式会社ＴＫＣのプレスリリース",
+                             "TKC、自治体DX推進フェアへ出展 - 産経ニュース")  # 全角英数・法人格・媒体名
+        self.assertDuplicate("栃木県真岡市で、生成ＡＩチャットボットの提供を開始！",
+                             "栃木県 真岡市で 生成AIチャットボットの提供を開始")  # 全角半角・空白・記号
+        self.assertDuplicate("栃木県真岡市で生成AIチャットボットの提供を開始", "真岡市で生成AIチャットボットの提供を開始 - 静岡新聞アットエス")
+
+    def test_normalize_title(self):
+        n = topic_dedup.normalize_title
+        self.assertEqual(n("ＡＩ活用 ｜ 〇〇新聞"), n("AI活用"))
+        self.assertEqual(n("【速報】 生成AI、導入へ！"), "速報生成ai導入へ")
+        self.assertEqual(n("A社のプレスリリース"), n("A社"))
+        self.assertEqual(n("Ａ株式会社"), n("a"))  # 法人格は無視。大文字小文字も無視
+
+    def test_same_company_different_news_is_not_duplicate(self):
+        # 実ログ: 同じQommonsAIでも、フェア出展と岐阜県庁での研修は別の出来事
+        self.assertNotDuplicate(QOMMONS_ASCII, QOMMONS_GIFU)
+        # 導入発表と研修実施はテンプレートが似ていても統合しない
+        a = "Polimill、行政向け生成AI「QommonsAI」の提供を開始"
+        b = "Polimill、行政向け生成AI「QommonsAI」の活用研修を実施"
+        self.assertGreaterEqual(topic_dedup.similarity(topic_dedup.normalize_title(a), topic_dedup.normalize_title(b)),
+                                topic_dedup.TOPIC_SIMILARITY_THRESHOLD)  # 文字列だけなら閾値を超える類似
+        self.assertNotDuplicate(a, b)
+        # 同じ市・同じ製品でも導入と研修は別
+        self.assertNotDuplicate("大分市、生成AIの導入を発表 庁内文書の検索を効率化", "大分市、生成AIの研修を実施 庁内文書の検索を効率化")
+
+    def test_similar_initiative_in_different_municipalities_is_not_duplicate(self):
+        a = "栃木県真岡市で、生成AIチャットボットの提供を開始"
+        b = "千葉県館山市で、生成AIチャットボットの提供を開始"
+        self.assertGreaterEqual(topic_dedup.similarity(topic_dedup.normalize_title(a), topic_dedup.normalize_title(b)),
+                                topic_dedup.TOPIC_SIMILARITY_THRESHOLD)
+        self.assertNotDuplicate(a, b)
+
+    def test_unrelated_company_mentions_and_same_event_name_are_not_duplicate(self):
+        # 実ログ: 同じ展示会名を含むだけの別々の出展案件・告知
+        self.assertNotDuplicate("2040年を見据えた自治体DX推進をテーマに、「地方自治情報化推進フェア2026」へ出展",
+                                "「地方自治情報化推進フェア2026」いよいよ10/27（火）・10/28（水）、幕張メッセで開催！ - 自治体DX | 行政 ニュース")
+        self.assertNotDuplicate("Bot Express、10月20日開催「TOHOKU DX GATEWAY 2026」に青森県むつ市と共同出展",
+                                "自治体DX需要の拡大を追い風に、ニーズウェルが「TOHOKU DX GATEWAY 2026」に出展")
+
+    def test_ambiguous_rewrites_are_not_asserted(self):
+        # 実ログ: 見出しが書き換えられた記事は、タイトルだけでは断定しない（NTT西日本の電波新聞）
+        self.assertNotDuplicate(NTT_DEMPA, NTT_PRTIMES)
+        self.assertNotDuplicate("デジタル庁OSS「源内」を活用した生成AIサービスを自治体で初めてLGWAN環境から利用可能に",
+                                "デジタル庁OSS「源内」活用の生成AI、大分市がLGWAN環境で自治体初導入")
+
+    def test_short_titles_are_not_compared(self):
+        self.assertNotDuplicate("DXアンテナ - Wikipedia", "ダウンタウンDX - Wikipedia")
+        self.assertIsNone(scored("デジタル庁", "デジタル庁"))
+
+    def test_place_subset_is_not_a_conflict(self):
+        self.assertEqual(topic_dedup.extract_places("栃木県真岡市で生成AI"), {"栃木県", "真岡市"})
+        self.assertEqual(topic_dedup.extract_places("実行計画区域施策編と地区と市町村の取組"), set())  # 一般語は自治体名としない
+
+    def test_thresholds_are_tunable_constants(self):
+        a = "デジタル庁OSS「源内」を活用した生成AIサービスを自治体で初めてLGWAN環境から利用可能に"
+        b = "デジタル庁OSS「源内」活用の生成AI、大分市がLGWAN環境で自治体初導入"
+        result = topic_dedup.detect_topic_duplicates([art(a, "https://a.example.jp/1")], [art(b, "https://b.example.jp/1", "2026-10-01")])
+        self.assertEqual((result.pair_count, result.near_misses), (0, 1))  # 既定では曖昧なので候補にせず、惜しい組み合わせとして数える
+        with mock.patch.object(topic_dedup, "TOPIC_SIMILARITY_THRESHOLD", 0.5):
+            result = topic_dedup.detect_topic_duplicates([art(a, "https://a.example.jp/1")], [art(b, "https://b.example.jp/1", "2026-10-01")])
+            self.assertEqual((result.pair_count, result.near_misses), (1, 0))
+        with mock.patch.object(topic_dedup, "TOPIC_SIMILARITY_THRESHOLD", 1.01):
+            result = topic_dedup.detect_topic_duplicates([art(QOMMONS_ASCII)], [art(QOMMONS_PRTIMES)])
+            self.assertEqual((result.pair_count, result.near_misses), (0, 1))
+
+
+class TopicPastLogs(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.logs = Path(self.tmp.name) / "logs"
+
+    def write_month(self, ym, entries):
+        """entries: [(retrieved, title, url)]。実ログと同じ形式で書く。"""
+        lines = [f"# {ym}"]
+        for day, title, url in entries:
+            lines += ["", f"## {day}", "", "### 自治体DX", "", f"#### {title}", "", f"- URL: {url}", f"- Source: x.example.jp",
+                      "- Queries: q", f"- Retrieved: {day}", "", "説明文は読まない"]
+        path = self.logs / ym[:4] / f"{ym}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def titles(self, today):
+        return sorted(a.title for a in topic_dedup.load_recent_articles(self.logs, today))
+
+    def test_parse_reads_only_url_title_retrieved(self):
+        path = self.write_month("2026-10", [("2026-10-05", "記事A", "https://a.example.jp/1")])
+        before = path.read_text(encoding="utf-8")
+        arts = topic_dedup.parse_log_articles(before)
+        self.assertEqual(arts, [topic_dedup.Article(url="https://a.example.jp/1", title="記事A", retrieved="2026-10-05")])
+        self.assertEqual(path.read_text(encoding="utf-8"), before)  # 読み取り専用
+
+    def test_parse_real_log_format_and_incomplete_entries(self):
+        text = "# 2026年10月\n\n## 2026-10-05\n\n### t\n\n#### 欠けた記事\n\n- URL: https://a.example.jp/1\n\n#### 完全な記事\n\n" \
+               "- URL: https://a.example.jp/2\n- Retrieved: 2026-10-05\n"
+        self.assertEqual([a.title for a in topic_dedup.parse_log_articles(text)], ["完全な記事"])  # Retrievedが無い記事は対象外
+
+    def test_window_boundary_7_days_included_8_excluded(self):
+        self.write_month("2026-10", [("2026-10-01", "八日前", "https://a.example.jp/8"), ("2026-10-02", "七日前", "https://a.example.jp/7"),
+                                     ("2026-10-09", "当日", "https://a.example.jp/0")])
+        self.assertEqual(self.titles("2026-10-09"), ["七日前", "当日"])
+
+    def test_window_spans_month_boundary(self):
+        self.write_month("2026-09", [("2026-09-25", "九月の古い記事", "https://a.example.jp/old"),
+                                     ("2026-09-28", "九月の記事", "https://a.example.jp/new")])
+        self.write_month("2026-10", [("2026-10-02", "十月の記事", "https://a.example.jp/oct")])
+        self.assertEqual(self.titles("2026-10-03"), ["九月の記事", "十月の記事"])  # 9/25は8日前なので対象外
+        self.assertEqual(topic_dedup.months_in_window("2026-10-03"), ["2026-09", "2026-10"])
+
+    def test_window_spans_year_boundary(self):
+        self.write_month("2026-12", [("2026-12-30", "去年の記事", "https://a.example.jp/y")])
+        self.write_month("2027-01", [("2027-01-02", "今年の記事", "https://a.example.jp/z")])
+        self.assertEqual(self.titles("2027-01-03"), ["今年の記事", "去年の記事"])
+
+    def test_missing_month_files_are_ignored(self):
+        self.assertEqual(self.titles("2026-10-03"), [])
+
+    def test_detects_duplicate_against_previous_month_log(self):
+        self.write_month("2026-09", [("2026-09-29", QOMMONS_ASCII, "https://ascii.jp/1")])
+        past = topic_dedup.load_recent_articles(self.logs, "2026-10-03")
+        result = topic_dedup.detect_topic_duplicates([art(QOMMONS_PRTIMES, "https://prtimes.jp/1")], past)
+        self.assertEqual((result.candidate_count, result.pair_count), (1, 1))
+        self.assertTrue(result.pairs[0].other_is_past)
+
+    def test_articles_older_than_window_are_not_compared(self):
+        self.write_month("2026-09", [("2026-09-24", QOMMONS_ASCII, "https://ascii.jp/1")])
+        past = topic_dedup.load_recent_articles(self.logs, "2026-10-03")
+        result = topic_dedup.detect_topic_duplicates([art(QOMMONS_PRTIMES, "https://prtimes.jp/1")], past)
+        self.assertEqual(result.pair_count, 0)
+
+
+class TopicDetect(unittest.TestCase):
+    def test_candidates_and_pairs_are_counted_separately(self):
+        past = [art(QOMMONS_ASCII, "https://ascii.jp/1", "2026-10-06"), art(QOMMONS_PRTIMES, "https://prtimes.jp/1", "2026-10-07")]
+        new = [art(QOMMONS_CODECAMP, "https://codecamp.jp/1"), art("無関係な自治体の別ニュース記事です", "https://x.example.jp/1")]
+        result = topic_dedup.detect_topic_duplicates(new, past)
+        self.assertEqual((result.candidate_count, result.pair_count), (1, 2))  # 1記事が2件の過去記事に一致
+
+    def test_within_same_run_each_pair_counted_once(self):
+        new = [art(QOMMONS_ASCII, "https://ascii.jp/1"), art(QOMMONS_PRTIMES, "https://prtimes.jp/1"), art(QOMMONS_CODECAMP, "https://codecamp.jp/1")]
+        result = topic_dedup.detect_topic_duplicates(new, [])
+        self.assertEqual((result.candidate_count, result.pair_count), (2, 3))  # 後から現れた2記事が候補、組み合わせは3通り
+        self.assertTrue(all(not p.other_is_past for p in result.pairs))
+
+    def test_does_not_mutate_inputs_and_no_false_positive_on_unrelated(self):
+        new = [art("自治体の生成AI活用を支援する新サービスを発表", "https://a.example.jp/1")]
+        past = [art("まったく別の防災アプリの配信を開始しました", "https://b.example.jp/1", "2026-10-01")]
+        n0, p0 = list(new), list(past)
+        result = topic_dedup.detect_topic_duplicates(new, past)
+        self.assertEqual((result.pair_count, new, past), (0, n0, p0))
+
+    def test_report_is_limited_and_has_no_description(self):
+        new = [art(f"{c}市、生成AIで窓口の待ち時間を短縮する新システムを稼働", f"https://a.example.jp/{c}") for c in "ABCDEFGHIJKLMNOPQRST"]
+        past = [art(f"{c}市、生成AIで窓口の待ち時間を短縮する新システムを稼働", f"https://b.example.jp/{c}", "2026-10-01") for c in "ABCDEFGHIJKLMNOPQRST"]
+        result = topic_dedup.detect_topic_duplicates(new, past)
+        lines = topic_dedup.format_report(result)
+        self.assertEqual(lines[0], f"Topic duplicate candidates: {result.candidate_count}")
+        self.assertEqual(lines[1], f"Topic duplicate pairs: {result.pair_count}")
+        self.assertLessEqual(len(lines), 3 + 2 * topic_dedup.TOPIC_MAX_REPORT_LINES + 1)
+        self.assertTrue(any("more pairs omitted" in ln for ln in lines) or result.pair_count <= topic_dedup.TOPIC_MAX_REPORT_LINES)
+        self.assertTrue(all(len(ln) < 200 for ln in lines))
+        self.assertFalse(any("http" in ln for ln in lines))
+
+
+class TopicRunIntegration(Base):
+    """run() 全体で、検出が観測のみであること（保存内容・API呼び出し数が変わらないこと）を確認する。APIは常にmock。"""
+
+    def setUp(self):
+        super().setUp()
+        self.brave_calls, self.jev_calls = [], []
+        self.titles = {}  # URL -> title
+
+    def responder(self, req, timeout=None):
+        if req.full_url.startswith(collect.JEV_ENDPOINT):
+            self.jev_calls.append(req.full_url)
+            return FakeResponse(jev_payload(0.9))
+        self.brave_calls.append(req.full_url)
+        return FakeResponse(api_payload(*[result(u, t) for u, t in self.titles.items()]))
+
+    def go(self, today, jev=True):
+        env = {"BRAVE_API_KEY": SECRET}
+        if jev:
+            env["JEV_API_KEY"] = JEV_SECRET
+        return self.run_collect(self.responder, today=today, env=env)
+
+    def seed_previous_day(self):
+        self.titles = {"https://ascii.jp/1": QOMMONS_ASCII}
+        self.go("2026-09-29")
+        self.brave_calls.clear(), self.jev_calls.clear()
+
+    def test_duplicates_are_reported_but_all_items_saved(self):
+        self.seed_previous_day()
+        prev_log = self.log_text("2026/2026-09.md")
+        self.titles = {"https://prtimes.jp/1": QOMMONS_PRTIMES, "https://codecamp.jp/1": QOMMONS_CODECAMP,
+                       "https://other.example.jp/1": "自治体の防災DXに関する全く別のニュース記事"}
+        code, _, out, err = self.go("2026-10-03")  # 月をまたぐ（過去ログは2026-09.md）
+        self.assertEqual(code, 0)
+        self.assertIn("Topic duplicate candidates: 2\n", out)
+        self.assertIn("Topic duplicate pairs: 3\n", out)  # PRTIMES→ASCII, CodeCamp→ASCII, CodeCamp→PRTIMES
+        saved = set(json.loads(self.seen.read_text(encoding="utf-8")))
+        self.assertEqual(saved, {"https://ascii.jp/1", "https://prtimes.jp/1", "https://codecamp.jp/1", "https://other.example.jp/1"})
+        text = self.log_text("2026/2026-10.md")
+        for url in ["https://prtimes.jp/1", "https://codecamp.jp/1", "https://other.example.jp/1"]:
+            self.assertIn(f"- URL: {url}", text)
+        self.assertEqual(self.log_text("2026/2026-09.md"), prev_log)  # 過去記事のMarkdownは変更しない
+        self.assertNotIn("説明", out.split("Topic duplicate")[1])  # 説明文は出さない
+        self.assertNotIn(SECRET, out + err)
+
+    def test_log_format_and_saved_files_are_identical_with_and_without_detection(self):
+        self.seed_previous_day()
+        self.titles = {"https://prtimes.jp/1": QOMMONS_PRTIMES, "https://codecamp.jp/1": QOMMONS_CODECAMP}
+        d = Path(self.tmp.name)
+        snapshot = {p.name: p.read_bytes() for p in d.rglob("*") if p.is_file()}
+        self.go("2026-10-03")
+        with_detection = (self.log_text("2026/2026-10.md"), self.seen.read_bytes(), self.months.read_bytes())
+        # 検出を無効化した場合（従来動作）と、保存内容が一致する
+        for p in list(d.rglob("*")):
+            if p.is_file() and p.name not in snapshot:
+                p.unlink()
+        self.seen.write_bytes(snapshot["seen.json"])
+        self.months.write_bytes(snapshot["months.json"])
+        (self.logs / "2026" / "2026-09.md").write_bytes(snapshot["2026-09.md"])
+        with mock.patch.object(collect, "detect_topic_duplicates", return_value=None):
+            self.go("2026-10-03")
+        without = (self.log_text("2026/2026-10.md"), self.seen.read_bytes(), self.months.read_bytes())
+        self.assertEqual(with_detection, without)
+
+    def test_api_request_counts_do_not_change(self):
+        self.seed_previous_day()
+        self.titles = {"https://prtimes.jp/1": QOMMONS_PRTIMES, "https://codecamp.jp/1": QOMMONS_CODECAMP}
+        self.go("2026-10-03")
+        self.assertEqual(len(self.brave_calls), 3)  # 検索語数（1検索語=1リクエスト）のまま
+        self.assertEqual(len(self.jev_calls), 2)  # ユニークな新規候補数のまま（重複候補でも追加・削減なし）
+        self.assertTrue(all(u.startswith(collect.API_ENDPOINT) for u in self.brave_calls))
+        self.assertTrue(all(u.startswith(collect.JEV_ENDPOINT) for u in self.jev_calls))
+
+    def test_no_duplicates_prints_zero_counts(self):
+        self.titles = {"https://a.example.jp/1": "自治体の防災DXに関する全く別のニュース記事"}
+        _, _, out, _ = self.go("2026-10-03")
+        self.assertIn("Topic duplicate candidates: 0\n", out)
+        self.assertIn("Topic duplicate pairs: 0\n", out)
+
+    def test_works_without_jev_key_and_with_no_new_items(self):
+        self.titles = {"https://a.example.jp/1": QOMMONS_ASCII}
+        self.go("2026-10-03", jev=False)
+        self.assertEqual(self.jev_calls, [])
+        _, _, out, _ = self.go("2026-10-04", jev=False)  # 同じURL＝新規なし
+        self.assertIn("Topic duplicate candidates: 0\n", out)
+
+    def test_detection_failure_never_blocks_saving(self):
+        self.titles = {"https://a.example.jp/1": QOMMONS_ASCII}
+        with mock.patch.object(topic_dedup, "load_recent_articles", side_effect=OSError("boom")):
+            code, _, out, _ = self.go("2026-10-03")
+        self.assertEqual(code, 0)
+        self.assertIn("::warning::topic duplicate detection skipped: error=OSError", out)
+        self.assertNotIn("boom", out)
+        self.assertIn("https://a.example.jp/1", self.seen.read_text(encoding="utf-8"))
+        self.assertIn("- URL: https://a.example.jp/1", self.log_text("2026/2026-10.md"))
+
+    def test_same_run_duplicates_are_all_saved(self):
+        self.titles = {"https://ascii.jp/1": QOMMONS_ASCII, "https://prtimes.jp/1": QOMMONS_PRTIMES}
+        _, _, out, _ = self.go("2026-10-07")
+        self.assertIn("Topic duplicate candidates: 1\n", out)
+        self.assertEqual(self.log_text("2026/2026-10.md").count("#### "), 2)
+        self.assertEqual(len(json.loads(self.seen.read_text(encoding="utf-8"))), 2)
 
 
 if __name__ == "__main__":
