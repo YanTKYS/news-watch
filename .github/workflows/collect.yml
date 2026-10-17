@@ -36,9 +36,16 @@ jobs:
           JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
         run: python scripts/collect.py
 
+      # Pagesの横断検索用インデックス（logs/ からの派生データ）。外部APIは使わない。
+      # 失敗しても日刊ログのcommitは続ける（インデックスは次回の実行で再生成される）。
+      - name: Update search index
+        continue-on-error: true
+        run: python scripts/search_index.py
+
       - name: Commit and push if there are new items
         run: |
           git add logs data/seen.json data/months.json data/jev-rejected.json
+          if [ -f data/search-index.json ]; then git add data/search-index.json; fi
           if git diff --cached --quiet; then
             echo "No new items; nothing to commit."
             exit 0

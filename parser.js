@@ -182,6 +182,51 @@ function rangeLabel(start, end) {
   return `${head}〜${Number(e[3])}日`;
 }
 
+// ---- 日刊ログの横断検索（data/search-index.json。scripts/search_index.py が生成） -------------
+// 全角英数・半角カナなどを NFKC で揃え、英字は小文字にして比較する。
+function normalizeText(text) {
+  return String(text || "").normalize("NFKC").toLowerCase();
+}
+
+// 空白（全角空白を含む）で区切ったキーワード。AND検索に使う。
+function splitKeywords(query) {
+  return normalizeText(query).split(/\s+/).filter(Boolean);
+}
+
+const textOf = (v) => (typeof v === "string" ? v : "");
+
+// インデックスの記事に検索用の文字列を付け、取得日の新しい順に並べる。URLが不正な記事・重複URLは除く。
+function buildSearchEntries(data) {
+  if (!Array.isArray(data)) return [];
+  const seen = new Set();
+  const entries = [];
+  for (const a of data) {
+    if (!a || typeof a !== "object") continue;
+    const url = safeUrl(a.url);
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    const item = {
+      title: textOf(a.title), url, source: textOf(a.source), published: textOf(a.published),
+      retrieved: textOf(a.retrieved), theme: textOf(a.theme), description: textOf(a.description),
+    };
+    // 検索対象: タイトル・説明文・テーマ・情報源。改行で区切り、項目をまたいで一致しないようにする。
+    item.haystack = normalizeText([item.title, item.description, item.theme, item.source].join("\n"));
+    entries.push(item);
+  }
+  // 安定ソートのため、同じ取得日はインデックスの順（ログの出現順）を保つ
+  return entries.sort((x, y) => (x.retrieved < y.retrieved ? 1 : x.retrieved > y.retrieved ? -1 : 0));
+}
+
+// すべてのキーワードを含む記事（部分一致・AND）。キーワードが無ければ空配列。
+function searchArticles(entries, query) {
+  const words = splitKeywords(query);
+  if (words.length === 0) return [];
+  return entries.filter((e) => words.every((w) => e.haystack.includes(w)));
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseLog, safeUrl, monthLabel, dateLabel, parseReview, unescapeMd, weekLabel, rangeLabel };
+  module.exports = {
+    parseLog, safeUrl, monthLabel, dateLabel, parseReview, unescapeMd, weekLabel, rangeLabel,
+    normalizeText, splitKeywords, buildSearchEntries, searchArticles,
+  };
 }
