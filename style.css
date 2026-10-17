@@ -49,10 +49,22 @@ body {
   line-height: 1.45;
 }
 .lead { margin: 4px 0 20px; color: var(--muted); font-size: 1rem; }
-.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; }
-.control-set { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; }
+/* 操作エリア。flex-wrap任せにせず、画面幅ごとに行構成を固定する（高さはすべて44px）。
+   〜719px: タブ（全幅）→ 月 → 並び順 → 検索欄（それぞれ1行）
+   720〜1099px: 1行目にタブ、2行目に表示中のタブの操作（日刊は 月｜並び順｜検索欄）
+   1100px〜: すべて横1行（検索欄が残りの幅を使う） */
+.controls { display: grid; grid-template-columns: minmax(0, 1fr); align-items: center; gap: 12px 24px; }
+.control-set {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: start;
+  align-items: center;
+  gap: 12px 16px;
+  min-width: 0;
+}
 .control-set[hidden] { display: none; }
-.search-box { display: flex; gap: 8px; flex: 1 1 320px; max-width: 520px; }
+.control-set > * { max-width: 100%; } /* 長い選択肢（週の期間など）でも狭い画面からはみ出さない */
+.search-box { display: flex; gap: 8px; justify-self: stretch; min-width: 0; }
 .search-box input {
   flex: 1;
   min-width: 0;
@@ -81,10 +93,10 @@ body {
 .search-empty { margin: 0; padding: 16px 0; }
 .more { display: block; margin: 24px auto 0; }
 .more[hidden] { display: none; }
-.mode-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 2px; }
+.mode-switch { display: flex; border: 1px solid var(--border); border-radius: 2px; }
 .mode-switch button {
   font: inherit;
-  min-height: 44px;
+  min-height: 42px; /* 枠線1px×2と合わせて、他の操作と同じ44pxにそろえる */
   min-width: 80px;
   padding: 0 20px;
   border: 0;
@@ -280,11 +292,18 @@ a:focus-visible, select:focus-visible, button:focus-visible, input:focus-visible
   .site-header { padding: 20px 0; }
   .controls { gap: 8px 12px; }
   .card { padding: 14px; }
-  .mode-switch { width: 100%; }
-  .search-box { flex-basis: 100%; max-width: none; }
-  .mode-switch button { flex: 1; }
   .weekly-section { margin-top: 32px; }
   .implication { padding: 12px; }
+}
+@media (max-width: 719px) {
+  .mode-switch button { flex: 1; } /* タブは全幅で均等割り */
+}
+@media (min-width: 720px) {
+  .mode-switch { justify-self: start; }
+  #daily-controls { grid-template-columns: auto auto minmax(260px, 1fr); }
+}
+@media (min-width: 1100px) {
+  .controls { grid-template-columns: auto minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
   .day-summary::before { transition: none; }
