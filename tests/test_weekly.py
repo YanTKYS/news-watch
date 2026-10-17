@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import weekly  # noqa: E402
 
 SECRET = "dummy-gemini-key-for-tests"  # 実キーではないテスト用ダミー値
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
 
 
 class FakeResponse:
@@ -39,7 +39,7 @@ def completion(content, finish_reason="STOP", usage=None):
         content = json.dumps(content, ensure_ascii=False)
     body = {"candidates": [{"content": {"role": "model", "parts": [{"text": content}]}, "finishReason": finish_reason,
                             "index": 0}],
-            "modelVersion": "gemini-2.5-flash"}
+            "modelVersion": "gemini-3.8-flash"}
     if usage is not None:
         body["usageMetadata"] = usage
     return body
@@ -95,7 +95,7 @@ class Base(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         d = Path(self.tmp.name)
         self.logs = d / "logs"
-        self.weekly_dir = d / "weekly"
+        self.weekly_dir = d / "reviews" / "weekly"
         self.weeks = d / "data" / "weeks.json"
 
     def run_weekly(self, responder, today="2026-10-19", week=None, force=False, env=None):
@@ -108,7 +108,7 @@ class Base(unittest.TestCase):
         return code, m, out.getvalue(), err.getvalue()
 
     def output(self, label="2026-W42"):
-        return self.weekly_dir / label[:4] / f"{label}.md"
+        return self.weekly_dir / f"{label}.md"
 
     def week42(self, n=3):
         """2026-W42（10/12〜18）に n 件、前後の週に1件ずつ。"""
@@ -141,7 +141,7 @@ class TargetWeek(unittest.TestCase):
         self.check("2027-01-11", "2027-01-04", "2027-01-10", "2027-W01")
         self.check("2025-01-06", "2024-12-30", "2025-01-05", "2025-W01")  # 暦年2024の月曜がISO週では2025年
         self.assertEqual(weekly.period_label(weekly.parse_week("2026-W53")), "2026年12月28日〜2027年1月3日")
-        self.assertEqual(weekly.output_path(Path("w"), weekly.parse_week("2025-W01")), Path("w/2025/2025-W01.md"))
+        self.assertEqual(weekly.output_path(Path("w"), weekly.parse_week("2025-W01")), Path("w/2025-W01.md"))  # 年別ディレクトリなし
 
     def test_parse_week_rejects_invalid(self):
         for bad in ("2026-42", "2026-W4", "2025-W53", "2026-W00", "W42", "2026-W42; rm -rf /"):
@@ -286,9 +286,9 @@ class RunFlow(Base):
             lambda *a, **k: FakeResponse(completion(review(["article-001", "article-003"], ["article-002"]), usage=usage)))
         self.assertEqual(code, 0, err)
         self.assertEqual(m.call_count, 1)
-        for line in ("Weekly target: 2026-W42", "Source articles: 3", "Selected articles: 3", "Model: gemini-2.5-flash",
+        for line in ("Weekly target: 2026-W42", "Source articles: 3", "Selected articles: 3", "Model: gemini-3.8-flash",
                      "API requests: 1", "Tokens: prompt=1200, output=800, thoughts=300, total=2300",
-                     "Output: weekly/2026/2026-W42.md"):
+                     "Output: reviews/weekly/2026-W42.md"):
             self.assertIn(line, out)
         md = self.output().read_text(encoding="utf-8")
         self.assertTrue(md.startswith("# 自治体DX・生成AI ウィークリーレビュー\n\n対象期間：2026年10月12日〜18日\n"))
@@ -297,7 +297,7 @@ class RunFlow(Base):
         self.assertIn("(https://a.example.jp/0)", md)
         self.assertIn("(https://a.example.jp/2)", md)
         self.assertNotIn("before", md)
-        self.assertIn("生成モデル：gemini-2.5-flash ／ 元記事：3件", md)
+        self.assertIn("生成モデル：gemini-3.8-flash ／ 元記事：3件", md)
         self.assertEqual(json.loads(self.weeks.read_text(encoding="utf-8")),
                          [{"week": "2026-W42", "start": "2026-10-12", "end": "2026-10-18"}])
 
@@ -450,7 +450,7 @@ class GeminiResponse(Base):
             400: {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "Invalid JSON payload received."}},
             403: {"error": {"code": 403, "status": "PERMISSION_DENIED", "message": f"Key {SECRET} has no access " + "x" * 800}},
             404: {"error": {"code": 404, "status": "NOT_FOUND",
-                            "message": "models/gemini-2.5-flash is not found for API version v1beta"}},
+                            "message": "models/gemini-3.8-flash is not found for API version v1beta"}},
             429: {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded."}},
         }
         for status, body in bodies.items():
@@ -458,7 +458,7 @@ class GeminiResponse(Base):
             self.assertEqual(code, 1)
             self.assertEqual(self.urls, [GEMINI_URL])  # 別モデルへのフォールバックなし
             line = next(ln for ln in err.splitlines() if ln.startswith("ERROR: Gemini API request failed"))
-            self.assertIn(f"model=gemini-2.5-flash): HTTP {status} status={body['error']['status']}", line)
+            self.assertIn(f"model=gemini-3.8-flash): HTTP {status} status={body['error']['status']}", line)
             self.assertLess(len(line), 400)
             self.assertFalse(self.output().exists())
             if status == 404:
@@ -479,7 +479,7 @@ class GeminiResponse(Base):
 
     def test_invalid_model_name_stops_before_api(self):
         self.week42()
-        for model in ("../v1/models/x", "gemini 2.5", "gemini-2.5-flash:generateContent?key=x"):
+        for model in ("../v1/models/x", "gemini 2.5", "gemini-3.8-flash:generateContent?key=x"):
             code, m, _, err = self.run_weekly(lambda *a, **k: self.fail("called"),
                                               env={"GEMINI_API_KEY": SECRET, "GEMINI_MODEL": model})
             self.assertEqual(code, 2, model)
@@ -583,8 +583,8 @@ class RenderMarkdown(unittest.TestCase):
     def test_weeks_index_lists_only_valid_files(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            for rel in ("2026/2026-W42.md", "2026/2026-W41.md", "2026/2025-W53.md", "2026/2026-W99.md", "2026/note.md",
-                        "2027/2026-W40.md"):
+            for rel in ("2026-W42.md", "2026-W41.md", "2025-W53.md", "2026-W99.md", "note.md",
+                        "2026/2026-W40.md"):  # 旧形式（年別ディレクトリ）は対象外
                 (root / rel).parent.mkdir(parents=True, exist_ok=True)
                 (root / rel).write_text("x", encoding="utf-8")
             self.assertEqual([w["week"] for w in weekly.list_weeks(root)], ["2026-W42", "2026-W41"])
@@ -601,7 +601,9 @@ class RepoLayout(unittest.TestCase):
         self.assertEqual(triggers["schedule"], [{"cron": "29 23 * * 0"}])  # 月曜 JST 8:29
         self.assertEqual(set(triggers["workflow_dispatch"]["inputs"]), {"week", "regenerate"})
         self.assertEqual(wf["permissions"], {"contents": "write"})
-        self.assertNotEqual(wf["concurrency"]["group"], "collect-news")
+        self.assertEqual(wf["concurrency"]["group"], "reviews")  # 月刊と直列（collect-news とは別）
+        self.assertIn("git add reviews/weekly", text)
+        self.assertNotRegex(text, r"git add weekly|\[ -d weekly \]")  # 旧保存先へは書き込まない
         self.assertIn("GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}", text)
         self.assertIn("GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}", text)
         self.assertNotIn("SARASHINA", text)
@@ -620,6 +622,17 @@ class RepoLayout(unittest.TestCase):
             self.assertFalse((ROOT / rel).exists(), rel)
         for rel in ("scripts/weekly.py", ".github/workflows/weekly.yml", "README.md"):
             self.assertNotIn("sarashina", (ROOT / rel).read_text(encoding="utf-8").lower(), rel)
+
+    def test_existing_weekly_reviews_migrated(self):
+        self.assertFalse((ROOT / "weekly").exists())  # 旧保存先 weekly/YYYY/ は残さない
+        entries = json.loads((ROOT / "data" / "weeks.json").read_text(encoding="utf-8"))
+        self.assertEqual([e["week"] for e in entries], [e["week"] for e in weekly.list_weeks(ROOT / "reviews" / "weekly")])
+        for e in entries:
+            md = (ROOT / "reviews" / "weekly" / f"{e['week']}.md").read_text(encoding="utf-8")
+            self.assertTrue(md.startswith(f"# {weekly.REVIEW_TITLE}"))
+            self.assertIn("出典：", md)
+        import inspect
+        self.assertEqual(inspect.signature(weekly.run).parameters["weekly_dir"].default, ROOT / "reviews" / "weekly")
 
     def test_weeks_json_is_list(self):
         self.assertIsInstance(json.loads((ROOT / "data" / "weeks.json").read_text(encoding="utf-8")), list)
@@ -650,8 +663,9 @@ class PagesParser(unittest.TestCase):
                           closing="まとめ。")
         md = weekly.render_markdown(weekly.parse_week("2026-W42"), r, {"article-001": a1, "article-002": a2}, 2,
                                     date(2026, 10, 19))
-        got = self.node("console.log(JSON.stringify(p.parseWeekly(process.argv[1])));", md)
+        got = self.node("console.log(JSON.stringify(p.parseReview(process.argv[1])));", md)
         self.assertEqual(got["title"], weekly.REVIEW_TITLE)
+        self.assertEqual(got["headings"], {"overview": "今週の概況", "topics": "注目トピック", "closing": "今週のまとめ"})
         self.assertEqual(got["period"], "2026年10月12日〜18日")
         self.assertEqual(got["overview"], ["1段落目。", "2段落目 *そのまま*。"])
         self.assertEqual(len(got["topics"]), 1)

@@ -91,11 +91,13 @@ function dateLabel(ymd) {
   return m ? `${m[1]}年${Number(m[2])}月${Number(m[3])}日` : ymd || "日付不明";
 }
 
-// weekly/YYYY/YYYY-Www.md（scripts/weekly.py が出力する形式）を表示用のデータ構造へ変換する。
+// 週刊・月刊レビューのMarkdown（scripts/weekly.py・monthly.py が出力する形式）を表示用のデータ構造へ変換する。
 //
-// 戻り値: { title, period, overview: [段落], topics: [{ title, body: [段落], implication: [段落],
-//           sources: [{ title, url }] }], closing: [段落], notes: [段落] }
-// 見出し: "# 誌名" > "## 今週の概況 / 注目トピック / 今週のまとめ" > "### N. トピック見出し"。"---" 以降は注記。
+// 戻り値: { title, period, headings: { overview, topics, closing }, overview: [段落],
+//           topics: [{ title, body: [段落], implication: [段落], sources: [{ title, url }] }],
+//           closing: [段落], notes: [段落] }
+// 見出し: "# 誌名" > "## 3つの節" > "### N. 見出し"。"---" 以降は注記。
+// 節は 週刊「今週の概況／注目トピック／今週のまとめ」、月刊「今月の総括／主要トレンド／翌月以降の注目点」。
 const IMPLICATION_LABEL = "自治体実務への示唆：";
 const SOURCE_RE = /^-\s*\[((?:\\.|[^\]\\])*)\]\((\S+)\)$/;
 
@@ -104,8 +106,17 @@ function unescapeMd(text) {
   return String(text).replace(/\\([!-\/:-@[-`{-~])/g, "$1");
 }
 
-function parseWeekly(markdown) {
-  const r = { title: "", period: "", overview: [], topics: [], closing: [], notes: [] };
+const SECTION_KEYS = [
+  ["overview", ["概況", "総括"]],
+  ["topics", ["トピック", "トレンド"]],
+  ["closing", ["まとめ", "注目点"]],
+];
+
+function parseReview(markdown) {
+  const r = {
+    title: "", period: "", headings: { overview: "", topics: "", closing: "" },
+    overview: [], topics: [], closing: [], notes: [],
+  };
   let section = null; // "overview" | "topics" | "closing" | "notes" | null
   let topic = null;
   let part = "body"; // トピック内の位置: "body" | "implication" | "sources"
@@ -122,8 +133,10 @@ function parseWeekly(markdown) {
     } else if (line.startsWith("# ")) {
       r.title = unescapeMd(line.slice(2).trim());
     } else if (line.startsWith("## ")) {
-      const name = line.slice(3);
-      section = name.includes("概況") ? "overview" : name.includes("トピック") ? "topics" : name.includes("まとめ") ? "closing" : null;
+      const name = line.slice(3).trim();
+      const found = SECTION_KEYS.find(([, words]) => words.some((w) => name.includes(w)));
+      section = found ? found[0] : null;
+      if (section) r.headings[section] = name;
       topic = null;
     } else if (line.startsWith("### ")) {
       if (section !== "topics") continue;
@@ -170,5 +183,5 @@ function rangeLabel(start, end) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseLog, safeUrl, monthLabel, dateLabel, parseWeekly, unescapeMd, weekLabel, rangeLabel };
+  module.exports = { parseLog, safeUrl, monthLabel, dateLabel, parseReview, unescapeMd, weekLabel, rangeLabel };
 }

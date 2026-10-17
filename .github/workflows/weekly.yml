@@ -23,9 +23,10 @@ on:
 permissions:
   contents: write
 
-# 週刊どうしは直列にする（collect.yml とは別グループ。commit対象のファイルは重ならない）。
+# 週刊・月刊（monthly.yml）は同じグループで直列にする（毎月1日が月曜の日も同時にpushしない）。
+# collect.yml とは別グループ（commit対象のファイルが重ならず、push時の pull --rebase で取り込める）。
 concurrency:
-  group: weekly-review
+  group: reviews
   cancel-in-progress: false
 
 jobs:
@@ -58,7 +59,7 @@ jobs:
       - name: Commit and push if the weekly review changed
         run: |
           git add data/weeks.json
-          if [ -d weekly ]; then git add weekly; fi
+          if [ -d reviews/weekly ]; then git add reviews/weekly; fi
           if git diff --cached --quiet; then
             echo "No changes; nothing to commit."
             exit 0
