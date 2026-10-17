@@ -1,0 +1,73 @@
+name: Weekly review
+
+# 前週の日刊ログ（logs/）から週刊レビューを生成する。Brave/Jev APIは使わない。
+# Sarashina APIは1回の実行で最大1リクエスト（リトライなし）。生成済みの週は regenerate 指定時のみ再生成する。
+# トリガーは schedule と workflow_dispatch のみ（Secretを使うため pull_request 等では実行しない）。
+on:
+  schedule:
+    # 毎週月曜 JST 08:29（UTC 日曜 23:29）
+    - cron: "29 23 * * 0"
+  workflow_dispatch:
+    inputs:
+      week:
+        description: "対象週（ISO 8601、例: 2026-W42）。空欄なら前週"
+        required: false
+        default: ""
+      regenerate:
+        description: "生成済みでも再生成する（APIを1回呼びます）"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+# 週刊どうしは直列にする（collect.yml とは別グループ。commit対象のファイルは重ならない）。
+concurrency:
+  group: weekly-review
+  cancel-in-progress: false
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate weekly review
+        env:
+          SARASHINA_API_KEY: ${{ secrets.SARASHINA_API_KEY }}
+          WEEK: ${{ inputs.week }}
+          REGENERATE: ${{ inputs.regenerate }}
+        run: |
+          args=()
+          if [ -n "$WEEK" ]; then args+=(--week "$WEEK"); fi
+          if [ "$REGENERATE" = "true" ]; then args+=(--force); fi
+          python scripts/weekly.py "${args[@]}"
+
+      - name: Commit and push if the weekly review changed
+        run: |
+          git add data/weeks.json
+          if [ -d weekly ]; then git add weekly; fi
+          if git diff --cached --quiet; then
+            echo "No changes; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: weekly review $(TZ=Asia/Tokyo date +%F)"
+          # 日刊収集が先にpushしていても取り込めるようにする（変更ファイルは重ならない）
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push && exit 0
+            sleep $((i * 5))
+          done
+          echo "push failed" >&2
+          exit 1
