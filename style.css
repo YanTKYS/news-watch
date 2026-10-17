@@ -50,6 +50,23 @@ body {
 }
 .lead { margin: 4px 0 20px; color: var(--muted); font-size: 1rem; }
 .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; }
+.control-set { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; }
+.control-set[hidden] { display: none; }
+.mode-switch { display: inline-flex; border: 1px solid var(--border); border-radius: 2px; }
+.mode-switch button {
+  font: inherit;
+  min-height: 44px;
+  min-width: 80px;
+  padding: 0 20px;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.mode-switch button + button { border-left: 1px solid var(--border); }
+.mode-switch button:hover { background: var(--band); }
+.mode-switch button[aria-pressed="true"] { background: var(--text); color: var(--bg); font-weight: 650; }
 .order-picker { display: flex; align-items: center; gap: 8px; color: var(--text); }
 select {
   font: inherit;
@@ -172,6 +189,51 @@ main.wrap { padding-top: 32px; padding-bottom: 72px; }
   font-weight: 650;
   line-height: 1.5;
 }
+/* 週刊: 1カラムの読み物。行長を抑える */
+.weekly { max-width: 42rem; }
+.weekly-head { padding-bottom: 12px; border-bottom: 2px solid var(--text); }
+.weekly-kicker { margin: 0 0 4px; color: var(--muted); font-size: .875rem; }
+.weekly-head h2 { margin: 0; font-size: 1.35rem; line-height: 1.45; }
+.weekly-period { margin: 4px 0 0; color: var(--muted); font-size: .94rem; }
+.weekly p { line-height: 1.85; }
+.weekly-section { margin-top: 40px; }
+.weekly-section > h3 {
+  margin: 0 0 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--subtle-border);
+  font-size: 1.2rem;
+  line-height: 1.5;
+}
+.weekly-section > p { margin: 0 0 1em; }
+.topic { margin: 0 0 40px; }
+.topic-title {
+  margin: 0 0 12px;
+  padding-left: 10px;
+  border-left: 3px solid var(--text);
+  font-size: 1.075rem;
+  line-height: 1.55;
+  font-weight: 650;
+}
+.topic > p { margin: 0 0 1em; }
+.implication { margin: 16px 0; padding: 12px 16px; background: var(--band); }
+.implication p { margin: 0 0 .5em; }
+.implication p:last-child { margin-bottom: 0; }
+.implication-label, .sources-label { font-size: .875rem; font-weight: 650; }
+.implication .implication-label { margin-bottom: 4px; line-height: 1.5; }
+.sources { margin-top: 16px; }
+.sources .sources-label { margin: 0 0 4px; color: var(--muted); line-height: 1.5; }
+.sources ul { margin: 0; padding-left: 1.25em; }
+.sources li { margin: 0 0 6px; font-size: .925rem; line-height: 1.6; }
+.sources a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.sources a:hover { text-decoration-thickness: 2px; }
+.weekly-notes {
+  margin-top: 40px;
+  padding-top: 16px;
+  border-top: 1px solid var(--subtle-border);
+  color: var(--muted);
+  font-size: .875rem;
+}
+.weekly-notes p { margin: 0 0 4px; line-height: 1.6; }
 .visually-hidden {
   position: absolute;
   width: 1px; height: 1px;
@@ -179,7 +241,7 @@ main.wrap { padding-top: 32px; padding-bottom: 72px; }
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
-a:focus-visible, select:focus-visible, .day-summary:focus-visible {
+a:focus-visible, select:focus-visible, button:focus-visible, .day-summary:focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 3px;
 }
@@ -189,6 +251,10 @@ a:focus-visible, select:focus-visible, .day-summary:focus-visible {
   .site-header { padding: 20px 0; }
   .controls { gap: 8px 12px; }
   .card { padding: 14px; }
+  .mode-switch { width: 100%; }
+  .mode-switch button { flex: 1; }
+  .weekly-section { margin-top: 32px; }
+  .implication { padding: 12px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .day-summary::before { transition: none; }

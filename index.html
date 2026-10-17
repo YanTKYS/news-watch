@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>news-watch</title>
-  <link rel="icon" href="data:,">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -14,17 +14,29 @@
       <h1>news-watch</h1>
       <p class="lead">自治体DX・自治体の生成AI活用に関する新着情報</p>
       <div class="controls">
-        <label>
-          <span class="visually-hidden">表示する月</span>
-          <select id="month-select" disabled></select>
-        </label>
-        <label class="order-picker">
-          <span>並び順</span>
-          <select id="order-select" disabled>
-            <option value="desc" selected>新しい順</option>
-            <option value="asc">古い順</option>
-          </select>
-        </label>
+        <div class="mode-switch" role="group" aria-label="表示の切り替え">
+          <button type="button" id="mode-daily" aria-pressed="true">日刊</button>
+          <button type="button" id="mode-weekly" aria-pressed="false">週刊</button>
+        </div>
+        <div class="control-set" id="daily-controls">
+          <label>
+            <span class="visually-hidden">表示する月</span>
+            <select id="month-select" disabled></select>
+          </label>
+          <label class="order-picker">
+            <span>並び順</span>
+            <select id="order-select" disabled>
+              <option value="desc" selected>新しい順</option>
+              <option value="asc">古い順</option>
+            </select>
+          </label>
+        </div>
+        <div class="control-set" id="weekly-controls" hidden>
+          <label>
+            <span class="visually-hidden">表示する週</span>
+            <select id="week-select" disabled></select>
+          </label>
+        </div>
       </div>
     </div>
   </header>
@@ -32,7 +44,7 @@
     <div id="status" role="status" aria-live="polite">読み込み中...</div>
     <div id="content"></div>
   </main>
-  <noscript><p class="wrap">このページの表示にはJavaScriptが必要です。ログは <a href="logs/">logs/</a> のMarkdownで直接読めます。</p></noscript>
+  <noscript><p class="wrap">このページの表示にはJavaScriptが必要です。ログは <a href="logs/">logs/</a>、週刊レビューは <a href="weekly/">weekly/</a> のMarkdownで直接読めます。</p></noscript>
   <script src="parser.js"></script>
   <script src="app.js"></script>
 </body>

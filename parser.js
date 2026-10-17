@@ -91,6 +91,84 @@ function dateLabel(ymd) {
   return m ? `${m[1]}年${Number(m[2])}月${Number(m[3])}日` : ymd || "日付不明";
 }
 
+// weekly/YYYY/YYYY-Www.md（scripts/weekly.py が出力する形式）を表示用のデータ構造へ変換する。
+//
+// 戻り値: { title, period, overview: [段落], topics: [{ title, body: [段落], implication: [段落],
+//           sources: [{ title, url }] }], closing: [段落], notes: [段落] }
+// 見出し: "# 誌名" > "## 今週の概況 / 注目トピック / 今週のまとめ" > "### N. トピック見出し"。"---" 以降は注記。
+const IMPLICATION_LABEL = "自治体実務への示唆：";
+const SOURCE_RE = /^-\s*\[((?:\\.|[^\]\\])*)\]\((\S+)\)$/;
+
+// Markdownのバックスラッシュエスケープ（\[ \* など）を元の文字に戻す。
+function unescapeMd(text) {
+  return String(text).replace(/\\([!-\/:-@[-`{-~])/g, "$1");
+}
+
+function parseWeekly(markdown) {
+  const r = { title: "", period: "", overview: [], topics: [], closing: [], notes: [] };
+  let section = null; // "overview" | "topics" | "closing" | "notes" | null
+  let topic = null;
+  let part = "body"; // トピック内の位置: "body" | "implication" | "sources"
+
+  for (const raw of String(markdown || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === "") continue;
+
+    if (line === "---") {
+      section = "notes";
+      topic = null;
+    } else if (section === "notes") {
+      r.notes.push(unescapeMd(line));
+    } else if (line.startsWith("# ")) {
+      r.title = unescapeMd(line.slice(2).trim());
+    } else if (line.startsWith("## ")) {
+      const name = line.slice(3);
+      section = name.includes("概況") ? "overview" : name.includes("トピック") ? "topics" : name.includes("まとめ") ? "closing" : null;
+      topic = null;
+    } else if (line.startsWith("### ")) {
+      if (section !== "topics") continue;
+      topic = { title: unescapeMd(line.slice(4).replace(/^\d+\.\s*/, "")), body: [], implication: [], sources: [] };
+      r.topics.push(topic);
+      part = "body";
+    } else if (section === null) {
+      if (line.startsWith("対象期間：")) r.period = line.slice(5).trim();
+    } else if (section === "topics") {
+      if (!topic) continue;
+      if (line === "出典：") {
+        part = "sources";
+      } else if (part === "sources") {
+        const m = SOURCE_RE.exec(line);
+        if (m) topic.sources.push({ title: unescapeMd(m[1]), url: m[2] });
+      } else if (line.startsWith(IMPLICATION_LABEL)) {
+        part = "implication";
+        topic.implication.push(unescapeMd(line.slice(IMPLICATION_LABEL.length)));
+      } else {
+        topic[part].push(unescapeMd(line));
+      }
+    } else {
+      r[section].push(unescapeMd(line));
+    }
+  }
+  return r;
+}
+
+// "2026-W42" -> "2026年第42週"。形式が不正なら null。
+function weekLabel(week) {
+  const m = /^(\d{4})-W(\d{2})$/.exec(week);
+  return m ? `${m[1]}年第${Number(m[2])}週` : null;
+}
+
+// ("2026-10-12", "2026-10-18") -> "10月12日〜18日"（年・月をまたぐ場合は省略しない）
+function rangeLabel(start, end) {
+  const s = /^(\d{4})-(\d{2})-(\d{2})$/.exec(start);
+  const e = /^(\d{4})-(\d{2})-(\d{2})$/.exec(end);
+  if (!s || !e) return "";
+  const head = `${Number(s[2])}月${Number(s[3])}日`;
+  if (s[1] !== e[1]) return `${s[1]}年${head}〜${e[1]}年${Number(e[2])}月${Number(e[3])}日`;
+  if (s[2] !== e[2]) return `${head}〜${Number(e[2])}月${Number(e[3])}日`;
+  return `${head}〜${Number(e[3])}日`;
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { parseLog, safeUrl, monthLabel, dateLabel };
+  module.exports = { parseLog, safeUrl, monthLabel, dateLabel, parseWeekly, unescapeMd, weekLabel, rangeLabel };
 }
