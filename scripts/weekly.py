@@ -2,8 +2,9 @@
 """前週（月曜〜日曜）の日刊ログから、AIで週刊レビューを生成して weekly/YYYY/YYYY-Www.md に保存する。
 
 - 入力は既存の logs/YYYY/YYYY-MM.md のみ（Brave/Jevの再検索はしない）。取得日 Retrieved で対象週を抽出する。
-- Sarashina APIは1週につき1リクエスト（リトライ・自動修復なし）。生成済みの週は --force 指定時のみ再生成する。
-- APIキーは環境変数 SARASHINA_API_KEY からのみ取得する（出力・保存しない）。
+- Gemini API（generateContent）は1週につき1リクエスト（リトライ・自動修復・別モデルへの切り替えなし）。
+  生成済みの週は --force 指定時のみ再生成する。モデルは環境変数 GEMINI_MODEL で変更できる。
+- APIキーは環境変数 GEMINI_API_KEY からのみ取得する（URL・ログ・ファイルに出さない）。
 - AIの出力（JSON）はPythonで検証し、出典URLは検証済みの記事IDからPython側で付与する。
 - 日刊ログ・seen.json は読み取りのみで、変更しない。
 """
@@ -25,12 +26,18 @@ import topic_dedup
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# ---- Sarashina API（利用量のハードリミット） -------------------------------------
-API_ENDPOINT = "https://api.sarashina.ai/v1/chat/completions"
-MODEL = "sarashina3-mini"
+# ---- Gemini API（利用量のハードリミット） ----------------------------------------
+API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+DEFAULT_MODEL = "gemini-2.5-flash"  # 環境変数 GEMINI_MODEL で上書きできる（自動フォールバックはしない）
+MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,99}$")
 TIMEOUT_SEC = 180
-MAX_COMPLETION_TOKENS = 4000  # 想定本文1,000〜1,500字に対して余裕を持たせた上限
+# 思考トークンは maxOutputTokens に含まれるため、思考の上限を決めた上で、本文（想定1,000〜1,500字の
+# JSONで数千トークン）が途中で切れない余裕を持たせる。
+THINKING_BUDGET = 2048
+MAX_OUTPUT_TOKENS = 16384
 MAX_RESPONSE_BYTES = 1_000_000
+MAX_ERROR_BODY_BYTES = 64_000
+MAX_ERROR_CHARS = 300
 USER_AGENT = "news-watch/1.0 (+https://github.com/YanTKYS/news-watch)"
 
 # ---- 入力の上限 ------------------------------------------------------------------
@@ -330,19 +337,23 @@ related_ids は、タイトルが似ていて同じ発表を扱っている可�
 
 
 def response_schema(valid_ids: list[str]) -> dict:
+    """Gemini の responseJsonSchema（JSON Schemaのサブセット）。出力は別途 validate_review で検証する。"""
     return {
         "type": "object",
         "properties": {
             "overview": {"type": "string"},
             "topics": {
                 "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_TOPICS,
                 "items": {
                     "type": "object",
                     "properties": {
                         "title": {"type": "string"},
                         "summary": {"type": "string"},
                         "implication": {"type": "string"},
-                        "source_ids": {"type": "array", "items": {"type": "string", "enum": valid_ids}},
+                        "source_ids": {"type": "array", "minItems": 1, "maxItems": MAX_SOURCES_PER_TOPIC,
+                                       "items": {"type": "string", "enum": valid_ids}},
                     },
                     "required": ["title", "summary", "implication", "source_ids"],
                     "additionalProperties": False,
@@ -371,63 +382,119 @@ def article_payload(a: Article) -> dict:
     return data
 
 
-def build_messages(week: Week, articles: list[Article]) -> list[dict]:
+def build_user_prompt(week: Week, articles: list[Article]) -> str:
     # 資料内の "</articles>" 等で区切りが崩れないよう、"<" をJSONのエスケープ表記にする（JSONとしては同値）。
     rows = [json.dumps(article_payload(a), ensure_ascii=False) for a in articles]  # 1記事1行
     body = ("[\n" + ",\n".join(rows) + "\n]").replace("<", "\\u003c")
-    user = (f"対象期間：{period_label(week)}（{week.label}）\n記事数：{len(articles)}件\n\n"
+    return (f"対象期間：{period_label(week)}（{week.label}）\n記事数：{len(articles)}件\n\n"
             f"<articles>\n{body}\n</articles>")
-    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
 
-def build_request(week: Week, articles: list[Article], api_key: str) -> urllib.request.Request:
+def resolve_model(env: dict) -> str:
+    """GEMINI_MODEL（未設定なら DEFAULT_MODEL）。URLのパスに入るため、モデル名として妥当な文字だけ許可する。"""
+    model = (env.get("GEMINI_MODEL") or "").strip().removeprefix("models/") or DEFAULT_MODEL
+    if not MODEL_RE.match(model):
+        raise WeeklyError(f"GEMINI_MODEL の値が不正です（例: {DEFAULT_MODEL}）")
+    return model
+
+
+def build_request(week: Week, articles: list[Article], api_key: str, model: str = DEFAULT_MODEL) -> urllib.request.Request:
+    """generateContent のリクエスト。tools（Google検索等）は指定しない。APIキーはURLではなくヘッダーで渡す。"""
     body = {
-        "model": MODEL,
-        "messages": build_messages(week, articles),
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "weekly_review", "strict": True,
-                            "schema": response_schema([a.id for a in articles])},
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": build_user_prompt(week, articles)}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": response_schema([a.id for a in articles]),
+            "maxOutputTokens": MAX_OUTPUT_TOKENS,
+            "thinkingConfig": {"thinkingBudget": THINKING_BUDGET},
         },
-        "max_completion_tokens": MAX_COMPLETION_TOKENS,
     }
     return urllib.request.Request(
-        API_ENDPOINT,
+        API_ENDPOINT.format(model=model),
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         method="POST",
         headers={
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
-            "Authorization": f"Bearer {api_key}",
+            "x-goog-api-key": api_key,
         },
     )
 
 
-def call_api(request: urllib.request.Request) -> tuple[str, dict]:
-    """1回だけ呼ぶ（リトライなし）。戻り値は (message.content, usage)。不正な応答は ValidationError。"""
+def call_api(request: urllib.request.Request) -> dict:
+    """1回だけ呼ぶ（リトライなし）。HTTPエラーは urllib.error.HTTPError、JSONでない応答は ValidationError。"""
     with urllib.request.urlopen(request, timeout=TIMEOUT_SEC) as resp:
         raw = resp.read(MAX_RESPONSE_BYTES + 1)
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValidationError("response too large")
     try:
         data = json.loads(raw)
-        choice = data["choices"][0]
-        content = choice["message"]["content"]
-    except (ValueError, KeyError, IndexError, TypeError) as e:
-        raise ValidationError(f"unexpected response structure ({type(e).__name__})") from e
-    if not isinstance(content, str):
-        raise ValidationError("message content is not a string")
-    if choice.get("finish_reason") == "length":
-        raise ValidationError("output truncated (finish_reason=length)")
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    return content, usage
+    except ValueError as e:
+        raise ValidationError("response is not JSON") from e
+    if not isinstance(data, dict):
+        raise ValidationError("response is not a JSON object")
+    return data
 
 
-def describe_error(e: Exception) -> str:
-    if isinstance(e, urllib.error.HTTPError):
-        return f"HTTP {e.code} (HTTPError)"
-    return type(e).__name__
+def extract_text(data: dict) -> str:
+    """候補（candidates[0]）の本文テキストを取り出す。ブロック・途中終了・候補なしは ValidationError。"""
+    feedback = data.get("promptFeedback") if isinstance(data.get("promptFeedback"), dict) else {}
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        reason = feedback.get("blockReason")
+        if isinstance(reason, str) and reason:
+            raise ValidationError(f"prompt was blocked (blockReason={reason})")
+        raise ValidationError("no candidates in response")
+    cand = candidates[0] if isinstance(candidates[0], dict) else {}
+    finish = cand.get("finishReason")
+    if finish == "MAX_TOKENS":
+        raise ValidationError("output truncated (finishReason=MAX_TOKENS)")
+    if finish != "STOP":  # SAFETY・RECITATION・PROHIBITED_CONTENT・OTHER 等。理由が無い場合も完了扱いにしない
+        raise ValidationError(f"generation did not finish normally (finishReason={finish if isinstance(finish, str) else '-'})")
+    parts = (cand.get("content") or {}).get("parts") if isinstance(cand.get("content"), dict) else None
+    if not isinstance(parts, list):
+        raise ValidationError("candidate has no content parts")
+    # 思考の要約（thought: true）は本文に含めない
+    text = "".join(p["text"] for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str) and not p.get("thought"))
+    if not text.strip():
+        raise ValidationError("candidate text is empty")
+    return text
+
+
+def usage_tokens(data: dict) -> dict[str, int]:
+    usage = data.get("usageMetadata") if isinstance(data.get("usageMetadata"), dict) else {}
+    names = {"promptTokenCount": "prompt", "candidatesTokenCount": "output", "thoughtsTokenCount": "thoughts",
+             "totalTokenCount": "total"}
+    return {label: usage[key] for key, label in names.items()
+            if isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool)}
+
+
+def sanitize(text: object, secret: str) -> str:
+    """ログ用に、APIキーをマスクし、制御文字を除いて1行・最大 MAX_ERROR_CHARS 文字にする。"""
+    text = str(text)
+    if secret:
+        text = text.replace(secret, "***")
+    text = " ".join("".join(c if c.isprintable() else " " for c in text).split())
+    return text if len(text) <= MAX_ERROR_CHARS else text[: MAX_ERROR_CHARS - 1] + "…"
+
+
+def describe_error(e: Exception, secret: str = "") -> str:
+    """HTTPエラーは本文（{"error": {code, status, message}}）から安全な概要だけを取り出す。本文全体は出さない。"""
+    if not isinstance(e, urllib.error.HTTPError):
+        return type(e).__name__
+    summary = f"HTTP {e.code}"
+    try:
+        err = json.loads(e.read(MAX_ERROR_BODY_BYTES) or b"").get("error")
+    except Exception:  # 本文が読めない・JSONでない
+        err = None
+    if isinstance(err, dict):
+        if isinstance(err.get("status"), str):
+            summary += f" status={err['status']}"
+        if isinstance(err.get("message"), str):
+            summary += f" message={err['message']}"
+    return sanitize(summary, secret)
 
 
 # ---- 出力の検証 ------------------------------------------------------------------
@@ -513,7 +580,7 @@ def md_url(url: str) -> str:
 
 
 def render_markdown(week: Week, review: Review, by_id: dict[str, Article], source_count: int,
-                    generated: date) -> str:
+                    generated: date, model: str = DEFAULT_MODEL) -> str:
     lines = [f"# {REVIEW_TITLE}", "", f"対象期間：{period_label(week)}", "", "## 今週の概況", ""]
     for p in paragraphs(review.overview):
         lines += [p, ""]
@@ -537,7 +604,7 @@ def render_markdown(week: Week, review: Review, by_id: dict[str, Article], sourc
     for p in paragraphs(review.closing):
         lines += [p, ""]
     lines += ["---", "", DISCLAIMER, "",
-              f"生成モデル：{MODEL} ／ 元記事：{source_count}件（うちAIへの入力 {len(by_id)}件） ／ 生成日：{generated.isoformat()}"]
+              f"生成モデル：{model} ／ 元記事：{source_count}件（うちAIへの入力 {len(by_id)}件） ／ 生成日：{generated.isoformat()}"]
     return "\n".join(lines) + "\n"
 
 
@@ -587,6 +654,7 @@ def run(
     env = os.environ if env is None else env
     today_d = date.fromisoformat(today) if today else datetime.now(JST).date()
     try:
+        model = resolve_model(env)
         week = parse_week(week_arg) if week_arg else previous_week(today_d)
         if week.end >= today_d:
             raise WeeklyError(f"{week.label} はまだ終わっていません（対象は終了した週のみ）")
@@ -620,31 +688,36 @@ def run(
     if len(selected) < len(articles):
         print(f"Not selected (limit {MAX_ARTICLES}): {len(articles) - len(selected)}")
     print(f"Same-topic candidate pairs (hint only, not removed): {pairs}")
-    print(f"Model: {MODEL}")
+    print(f"Model: {model}")
 
-    api_key = (env.get("SARASHINA_API_KEY") or "").strip()
+    api_key = (env.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
-        print("ERROR: 環境変数 SARASHINA_API_KEY が設定されていません。"
+        print("ERROR: 環境変数 GEMINI_API_KEY が設定されていません。"
               "GitHub の Settings → Secrets and variables → Actions で登録してください。", file=sys.stderr)
         return 2
 
     print("API requests: 1")
     try:
-        content, usage = call_api(build_request(week, selected, api_key))
-        review = validate_review(content, {a.id for a in selected})
+        data = call_api(build_request(week, selected, api_key, model))
     except ValidationError as e:
-        print(f"ERROR: invalid API output; weekly review was not saved: {e}", file=sys.stderr)
+        print(f"ERROR: invalid API response; weekly review was not saved: {e}", file=sys.stderr)
         return 1
-    except Exception as e:  # リトライしない。本文・ヘッダ・キーは出力しない。
-        print(f"ERROR: Sarashina API request failed: {describe_error(e)}", file=sys.stderr)
+    except Exception as e:  # リトライ・別モデルへの切り替えはしない。本文・ヘッダ・キーは出力しない。
+        print(f"ERROR: Gemini API request failed (model={model}): {describe_error(e, api_key)}", file=sys.stderr)
+        if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+            print("::warning::モデルが存在しないか利用できない可能性があります。GEMINI_MODEL を確認してください。")
         return 1
-    tokens = {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-              if isinstance(usage.get(k), int) and not isinstance(usage.get(k), bool)}
+    tokens = usage_tokens(data)
     if tokens:
-        print("Tokens: " + ", ".join(f"{k.removesuffix('_tokens')}={v}" for k, v in tokens.items()))
+        print("Tokens: " + ", ".join(f"{k}={v}" for k, v in tokens.items()))
+    try:
+        review = validate_review(extract_text(data), {a.id for a in selected})
+    except ValidationError as e:
+        print(f"ERROR: invalid API output; weekly review was not saved: {sanitize(e, api_key)}", file=sys.stderr)
+        return 1
 
     by_id = {a.id: a for a in selected}
-    write_atomic(out, render_markdown(week, review, by_id, len(articles), today_d))
+    write_atomic(out, render_markdown(week, review, by_id, len(articles), today_d, model))
     update_weeks(weeks_path, weekly_dir)
     print(f"Topics: {len(review.topics)}")
     print(f"Output: {rel}")

@@ -1,7 +1,8 @@
 name: Weekly review
 
 # 前週の日刊ログ（logs/）から週刊レビューを生成する。Brave/Jev APIは使わない。
-# Sarashina APIは1回の実行で最大1リクエスト（リトライなし）。生成済みの週は regenerate 指定時のみ再生成する。
+# Gemini APIは1回の実行で最大1リクエスト（リトライ・別モデルへの切り替えなし）。生成済みの週は regenerate 指定時のみ再生成する。
+# モデルは Repository variable GEMINI_MODEL で変更できる（未設定なら scripts/weekly.py の既定値）。
 # トリガーは schedule と workflow_dispatch のみ（Secretを使うため pull_request 等では実行しない）。
 on:
   schedule:
@@ -44,7 +45,8 @@ jobs:
 
       - name: Generate weekly review
         env:
-          SARASHINA_API_KEY: ${{ secrets.SARASHINA_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           WEEK: ${{ inputs.week }}
           REGENERATE: ${{ inputs.regenerate }}
         run: |

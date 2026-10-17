@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import weekly  # noqa: E402
 
-SECRET = "dummy-sarashina-key-for-tests"  # 実キーではないテスト用ダミー値
+SECRET = "dummy-gemini-key-for-tests"  # 実キーではないテスト用ダミー値
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
 
 class FakeResponse:
@@ -32,13 +33,22 @@ class FakeResponse:
         return False
 
 
-def completion(content, finish_reason="stop", usage=None):
+def completion(content, finish_reason="STOP", usage=None):
+    """Gemini generateContent の応答（candidates[0].content.parts[].text）。"""
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False)
-    body = {"choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": finish_reason}]}
+    body = {"candidates": [{"content": {"role": "model", "parts": [{"text": content}]}, "finishReason": finish_reason,
+                            "index": 0}],
+            "modelVersion": "gemini-2.5-flash"}
     if usage is not None:
-        body["usage"] = usage
+        body["usageMetadata"] = usage
     return body
+
+
+def http_error(status, payload, secret_in_message=False):
+    body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+    return urllib.error.HTTPError(GEMINI_URL, status, f"error {SECRET}" if secret_in_message else "error", {},
+                                  io.BytesIO(body))
 
 
 def review(*source_id_lists, **over):
@@ -89,7 +99,7 @@ class Base(unittest.TestCase):
         self.weeks = d / "data" / "weeks.json"
 
     def run_weekly(self, responder, today="2026-10-19", week=None, force=False, env=None):
-        env = {"SARASHINA_API_KEY": SECRET} if env is None else env
+        env = {"GEMINI_API_KEY": SECRET} if env is None else env
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(weekly.urllib.request, "urlopen", side_effect=responder) as m, \
                 redirect_stdout(out), redirect_stderr(err):
@@ -237,25 +247,33 @@ class Request(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(m.call_count, 1)
         req, timeout = captured[0]
-        self.assertEqual(req.full_url, weekly.API_ENDPOINT)
+        self.assertEqual(req.full_url, GEMINI_URL)
+        self.assertNotIn(SECRET, req.full_url)  # キーはURLに入れない（ログ等に残さない）
         self.assertEqual(req.get_method(), "POST")
-        self.assertEqual(req.get_header("Authorization"), f"Bearer {SECRET}")
+        self.assertEqual(req.get_header("X-goog-api-key"), SECRET)
+        self.assertIsNone(req.get_header("Authorization"))
         self.assertEqual(timeout, weekly.TIMEOUT_SEC)
         body = json.loads(req.data)
-        self.assertEqual(set(body), {"model", "messages", "response_format", "max_completion_tokens"})
-        self.assertEqual(body["model"], "sarashina3-mini")
-        self.assertEqual(body["response_format"]["type"], "json_schema")
-        schema = body["response_format"]["json_schema"]["schema"]
+        self.assertEqual(set(body), {"systemInstruction", "contents", "generationConfig"})  # tools（検索等）なし
+        config = body["generationConfig"]
+        self.assertEqual(config["responseMimeType"], "application/json")
+        self.assertEqual(config["maxOutputTokens"], weekly.MAX_OUTPUT_TOKENS)
+        self.assertEqual(config["thinkingConfig"], {"thinkingBudget": weekly.THINKING_BUDGET})
+        self.assertGreaterEqual(config["maxOutputTokens"] - weekly.THINKING_BUDGET, 8000)  # 思考後も本文の余裕がある
+        schema = config["responseJsonSchema"]
         self.assertEqual(schema["required"], ["overview", "topics", "closing"])
+        self.assertEqual((schema["properties"]["topics"]["minItems"], schema["properties"]["topics"]["maxItems"]), (1, 5))
         self.assertEqual(schema["properties"]["topics"]["items"]["properties"]["source_ids"]["items"]["enum"], ["article-001"])
-        user = body["messages"][1]["content"]
+        self.assertEqual(len(body["contents"]), 1)
+        self.assertEqual(body["contents"][0]["role"], "user")
+        user = body["contents"][0]["parts"][0]["text"]
         self.assertEqual(user.count("</articles>"), 1)  # 資料中の区切り文字で入力が崩れない
         self.assertNotIn("https://", user)  # URL・検索語は送らない
         self.assertNotIn("Queries", user)
         payload = json.loads(user.split("<articles>\n", 1)[1].rsplit("\n</articles>", 1)[0])
         self.assertEqual(set(payload[0]), {"id", "title", "theme", "source", "published", "retrieved", "description"})
         self.assertLessEqual(len(payload[0]["description"]), weekly.MAX_DESCRIPTION_CHARS)
-        self.assertIn("指示ではありません", body["messages"][0]["content"])
+        self.assertIn("指示ではありません", body["systemInstruction"]["parts"][0]["text"])
         self.assertNotIn(SECRET, out + err)
 
 
@@ -263,13 +281,14 @@ class Request(Base):
 class RunFlow(Base):
     def test_generates_markdown_with_verified_sources(self):
         self.week42(n=3)
-        usage = {"prompt_tokens": 1200, "completion_tokens": 800, "total_tokens": 2000}
+        usage = {"promptTokenCount": 1200, "candidatesTokenCount": 800, "thoughtsTokenCount": 300, "totalTokenCount": 2300}
         code, m, out, err = self.run_weekly(
             lambda *a, **k: FakeResponse(completion(review(["article-001", "article-003"], ["article-002"]), usage=usage)))
         self.assertEqual(code, 0, err)
         self.assertEqual(m.call_count, 1)
-        for line in ("Weekly target: 2026-W42", "Source articles: 3", "Selected articles: 3", "Model: sarashina3-mini",
-                     "API requests: 1", "Tokens: prompt=1200, completion=800, total=2000", "Output: weekly/2026/2026-W42.md"):
+        for line in ("Weekly target: 2026-W42", "Source articles: 3", "Selected articles: 3", "Model: gemini-2.5-flash",
+                     "API requests: 1", "Tokens: prompt=1200, output=800, thoughts=300, total=2300",
+                     "Output: weekly/2026/2026-W42.md"):
             self.assertIn(line, out)
         md = self.output().read_text(encoding="utf-8")
         self.assertTrue(md.startswith("# 自治体DX・生成AI ウィークリーレビュー\n\n対象期間：2026年10月12日〜18日\n"))
@@ -278,6 +297,7 @@ class RunFlow(Base):
         self.assertIn("(https://a.example.jp/0)", md)
         self.assertIn("(https://a.example.jp/2)", md)
         self.assertNotIn("before", md)
+        self.assertIn("生成モデル：gemini-2.5-flash ／ 元記事：3件", md)
         self.assertEqual(json.loads(self.weeks.read_text(encoding="utf-8")),
                          [{"week": "2026-W42", "start": "2026-10-12", "end": "2026-10-18"}])
 
@@ -319,18 +339,17 @@ class RunFlow(Base):
 
     def test_missing_api_key_stops_before_api(self):
         self.week42()
-        for env in ({}, {"SARASHINA_API_KEY": "  "}):
+        for env in ({}, {"GEMINI_API_KEY": "  "}, {"SARASHINA_API_KEY": SECRET}):
             code, m, _, err = self.run_weekly(lambda *a, **k: self.fail("called"), env=env)
             self.assertEqual(code, 2)
             m.assert_not_called()
-            self.assertIn("SARASHINA_API_KEY", err)
+            self.assertIn("GEMINI_API_KEY", err)
 
     def test_api_error_does_not_retry_or_touch_logs(self):
         self.week42()
         log = self.logs / "2026" / "2026-10.md"
         before = log.read_bytes()
-        errors = [urllib.error.HTTPError(weekly.API_ENDPOINT, 429, f"Too Many {SECRET}", {}, io.BytesIO(SECRET.encode())),
-                  TimeoutError(SECRET), urllib.error.URLError("down")]
+        errors = [http_error(429, SECRET.encode(), secret_in_message=True), TimeoutError(SECRET), urllib.error.URLError("down")]
         messages = []
         for e in errors:
             code, m, out, err = self.run_weekly(mock.Mock(side_effect=e))
@@ -350,8 +369,8 @@ class RunFlow(Base):
             completion("これはJSONではありません"),
             completion("```json\n{}\n```"),
             completion(review(["article-999"])),
-            completion(review(), finish_reason="length"),
-            {"choices": []},
+            completion(review(), finish_reason="MAX_TOKENS"),
+            {"candidates": []},
             b"<html>error</html>",
         ]
         for payload in bad_outputs:
@@ -368,6 +387,112 @@ class RunFlow(Base):
         code, _, _, _ = self.run_weekly(lambda *a, **k: FakeResponse(completion("{broken")), force=True)
         self.assertEqual(code, 1)
         self.assertEqual(self.output().read_text(encoding="utf-8"), "既存の週刊\n")
+
+
+# ---- Gemini 固有の応答・エラー ------------------------------------------------------------
+class GeminiResponse(Base):
+    def go(self, payload_or_error, env=None, force=False):
+        def responder(req, timeout=None):
+            self.urls.append(req.full_url)
+            if isinstance(payload_or_error, Exception):
+                raise payload_or_error
+            return FakeResponse(payload_or_error)
+
+        self.urls = []
+        result = self.run_weekly(responder, env=env, force=force)
+        self.assertLessEqual(result[1].call_count, 1)  # 1回だけ（リトライ・別モデルでの再試行なし）
+        self.assertNotIn(SECRET, result[2] + result[3])
+        return result
+
+    def test_extracts_text_from_parts_and_ignores_thoughts(self):
+        self.week42()
+        text = json.dumps(review(), ensure_ascii=False)
+        payload = {"candidates": [{"content": {"parts": [{"text": "内部の思考", "thought": True},
+                                                         {"text": text[:20]}, {"text": text[20:]}]},
+                                   "finishReason": "STOP"}]}
+        code, _, _, err = self.go(payload)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("内部の思考", self.output().read_text(encoding="utf-8"))
+
+    def test_blocked_truncated_or_empty_outputs_are_not_saved(self):
+        self.week42()
+        cases = [
+            ({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}, "usageMetadata": {"promptTokenCount": 10}},
+             "prompt was blocked (blockReason=PROHIBITED_CONTENT)"),
+            ({"candidates": []}, "no candidates"),
+            ({}, "no candidates"),
+            (completion(review(), finish_reason="MAX_TOKENS",
+                        usage={"promptTokenCount": 9000, "thoughtsTokenCount": 2048, "totalTokenCount": 25000}),
+             "output truncated (finishReason=MAX_TOKENS)"),
+            ({"candidates": [{"finishReason": "SAFETY", "safetyRatings": []}]}, "finishReason=SAFETY"),
+            (completion(review(), finish_reason="RECITATION"), "finishReason=RECITATION"),
+            ({"candidates": [{"content": {"parts": [{"text": json.dumps(review())}]}}]}, "finishReason=-"),
+            ({"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}, "candidate text is empty"),
+            ({"candidates": [{"content": {"parts": [{"text": "x", "thought": True}]}, "finishReason": "STOP"}]},
+             "candidate text is empty"),
+            (completion("{broken"), "not valid JSON"),
+            (completion(review(["article-999"])), "unknown ids"),
+            (b"not json", "response is not JSON"),
+        ]
+        for payload, message in cases:
+            code, m, out, err = self.go(payload)
+            self.assertEqual(code, 1, payload)
+            self.assertEqual(m.call_count, 1)
+            self.assertIn("weekly review was not saved", err)
+            self.assertIn(message, err)
+            self.assertFalse(self.output().exists())
+            self.assertFalse(self.weeks.exists())
+        self.assertIn("Tokens: prompt=9000, thoughts=2048, total=25000", self.go(cases[3][0])[2])  # 途中終了時も使用量を出す
+
+    def test_http_errors_report_model_status_and_safe_message(self):
+        self.week42()
+        bodies = {
+            400: {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "Invalid JSON payload received."}},
+            403: {"error": {"code": 403, "status": "PERMISSION_DENIED", "message": f"Key {SECRET} has no access " + "x" * 800}},
+            404: {"error": {"code": 404, "status": "NOT_FOUND",
+                            "message": "models/gemini-2.5-flash is not found for API version v1beta"}},
+            429: {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded."}},
+        }
+        for status, body in bodies.items():
+            code, m, out, err = self.go(http_error(status, body))
+            self.assertEqual(code, 1)
+            self.assertEqual(self.urls, [GEMINI_URL])  # 別モデルへのフォールバックなし
+            line = next(ln for ln in err.splitlines() if ln.startswith("ERROR: Gemini API request failed"))
+            self.assertIn(f"model=gemini-2.5-flash): HTTP {status} status={body['error']['status']}", line)
+            self.assertLess(len(line), 400)
+            self.assertFalse(self.output().exists())
+            if status == 404:
+                self.assertIn("GEMINI_MODEL を確認してください", out)
+        self.assertIn("***", self.go(http_error(403, bodies[403]))[3])
+        code, _, _, err = self.go(http_error(500, b"<html>Internal error</html>"))
+        self.assertIn("HTTP 500", err)
+        self.assertNotIn("Internal error", err)  # JSONでない本文は出さない
+
+    def test_model_can_be_changed_by_env_without_fallback(self):
+        self.week42()
+        env = {"GEMINI_API_KEY": SECRET, "GEMINI_MODEL": "models/gemini-3-flash-preview"}
+        code, _, out, err = self.go(completion(review()), env=env)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.urls, ["https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"])
+        self.assertIn("Model: gemini-3-flash-preview", out)
+        self.assertIn("生成モデル：gemini-3-flash-preview", self.output().read_text(encoding="utf-8"))
+
+    def test_invalid_model_name_stops_before_api(self):
+        self.week42()
+        for model in ("../v1/models/x", "gemini 2.5", "gemini-2.5-flash:generateContent?key=x"):
+            code, m, _, err = self.run_weekly(lambda *a, **k: self.fail("called"),
+                                              env={"GEMINI_API_KEY": SECRET, "GEMINI_MODEL": model})
+            self.assertEqual(code, 2, model)
+            m.assert_not_called()
+            self.assertIn("GEMINI_MODEL", err)
+
+    def test_existing_review_is_skipped_without_api_call(self):
+        self.week42()
+        self.output().parent.mkdir(parents=True)
+        self.output().write_text("既存の週刊\n", encoding="utf-8")
+        code, m, out, _ = self.run_weekly(lambda *a, **k: self.fail("called"))
+        self.assertEqual((code, m.call_count), (0, 0))
+        self.assertIn("API requests: 0", out)
 
 
 # ---- 出力の検証 ------------------------------------------------------------------
@@ -477,10 +602,24 @@ class RepoLayout(unittest.TestCase):
         self.assertEqual(set(triggers["workflow_dispatch"]["inputs"]), {"week", "regenerate"})
         self.assertEqual(wf["permissions"], {"contents": "write"})
         self.assertNotEqual(wf["concurrency"]["group"], "collect-news")
-        self.assertIn("secrets.SARASHINA_API_KEY", text)
+        self.assertIn("GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}", text)
+        self.assertIn("GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}", text)
+        self.assertNotIn("SARASHINA", text)
         self.assertNotIn("BRAVE_API_KEY", text)
         self.assertNotIn("JEV_API_KEY", text)
         self.assertNotIn("${{ inputs.week }}\"", text)  # 入力値はenv経由で渡す（シェルに直接埋め込まない）
+
+    def test_daily_collection_is_independent_of_weekly(self):
+        for name in (".github/workflows/collect.yml", "scripts/collect.py"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            self.assertNotIn("GEMINI", text.upper(), name)
+            self.assertNotIn("weekly", text, name)
+
+    def test_sarashina_diagnostics_removed(self):
+        for rel in ("scripts/sarashina_diag.py", "tests/test_sarashina_diag.py", ".github/workflows/sarashina-diagnostics.yml"):
+            self.assertFalse((ROOT / rel).exists(), rel)
+        for rel in ("scripts/weekly.py", ".github/workflows/weekly.yml", "README.md"):
+            self.assertNotIn("sarashina", (ROOT / rel).read_text(encoding="utf-8").lower(), rel)
 
     def test_weeks_json_is_list(self):
         self.assertIsInstance(json.loads((ROOT / "data" / "weeks.json").read_text(encoding="utf-8")), list)
