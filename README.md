@@ -94,6 +94,9 @@ Brave・Jevは呼び出さず、日刊ログ・`seen.json` は読み取るだけ
 - **手動実行**: Actions → `Weekly review` → Run workflow。`week`（例: `2026-W42`、空欄なら前週）と、
   生成済みの週を上書きする場合のみ `regenerate` を指定します。終了していない週は指定できません。
 - **ローカル実行**（任意）: `SARASHINA_API_KEY` を環境変数に設定して `python scripts/weekly.py [--week 2026-W42] [--force]`
+- **接続診断**（一時的）: Actions → `Sarashina API diagnostics` → Run workflow。最小リクエスト（A）と週刊と同じ形式のリクエスト（B）を
+  1回ずつ送り、HTTPステータス・APIのエラーコード／メッセージ・リクエストID等をログに表示します（最大2リクエスト、ファイルの変更なし）。
+  APIキー・リクエスト全文・レスポンス全文は表示しません。調査後は `scripts/sarashina_diag.py` とワークフローを削除できます。
 
 ## GitHub Pagesで読む
 

@@ -1,0 +1,26 @@
+name: Sarashina API diagnostics
+
+# 週刊レビュー生成時の HTTP 403 の原因切り分け用（scripts/sarashina_diag.py）。
+# 手動実行のみ（scheduleなし）。Sarashina APIへ最大2リクエスト（リトライなし）。
+# ファイルの変更・commit/pushは行わない。調査が終わったら、このファイルごと削除してよい。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run diagnostics
+        env:
+          SARASHINA_API_KEY: ${{ secrets.SARASHINA_API_KEY }}
+        run: python scripts/sarashina_diag.py
