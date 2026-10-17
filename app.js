@@ -1,6 +1,7 @@
 "use strict";
 // 閲覧UI。日刊は data/months.json と logs/YYYY/YYYY-MM.md、週刊は data/weeks.json と reviews/weekly/YYYY-Www.md、
 // 月刊は data/review-months.json と reviews/monthly/YYYY-MM.md を相対パスで読み取るだけ。
+// 日刊の横断検索は data/search-index.json を初回検索時に1回だけ読み、ブラウザ内で絞り込む。
 // 外部由来の文字列は textContent と検証済みURLのhref設定のみで描画する（innerHTML は使わない）。
 
 const MONTH_RE = /^\d{4}-\d{2}$/;
@@ -14,12 +15,20 @@ const modeButtons = {
   weekly: document.getElementById("mode-weekly"),
   monthly: document.getElementById("mode-monthly"),
 };
+const searchInput = document.getElementById("search-input");
+const searchClear = document.getElementById("search-clear");
 const statusEl = document.getElementById("status");
 const content = document.getElementById("content");
 let loadToken = 0; // 連続切替時に古い応答で上書きしない（日刊・週刊・月刊で共通）
 let sortOrder = "desc"; // "desc"=新しい順 / "asc"=古い順（月を切り替えても維持。永続化はしない）
 let current = null; // 表示中の月 { ym, days }。並び順変更時の再描画に使う
 let mode = "daily"; // "daily" | "weekly" | "monthly"
+const SEARCH_PAGE_SIZE = 50; // 検索結果は50件ずつ表示する（「さらに表示」で追加）
+const SEARCH_DELAY_MS = 250; // 入力が止まってから検索する（入力途中の再描画を抑える）
+let searchQuery = ""; // 検索中のキーワード（空なら通常の日刊表示）
+let searchEntries = null; // buildSearchEntries の結果（初回検索時に読み込み、以後は再利用）
+let searchLoading = null; // 読み込み中の Promise（同時に複数回取得しない）
+let searchTimer = 0;
 
 // 週刊・月刊の設定。一覧（index）は初めてそのタブを開いたときに読む。
 const REVIEWS = {
@@ -103,9 +112,10 @@ function renderCard(item) {
     link.rel = "noopener noreferrer";
     bottom.appendChild(link);
   }
-  if (item.queries || item.retrieved) {
+  if (item.queries || item.retrieved || item.theme) {
     const parts = [];
     if (item.retrieved) parts.push(`取得日: ${item.retrieved}`);
+    if (item.theme) parts.push(`テーマ: ${item.theme}`); // 検索結果のみ（日刊表示ではテーマは見出し）
     if (item.queries) parts.push(`検索語: ${item.queries}`);
     const foot = el("p", "foot", parts.join(" / "));
     foot.title = parts.join(" / "); // 1行表示で省略された場合に全文を確認できる
@@ -160,7 +170,7 @@ function renderMonth(ym, days, order) {
 }
 
 async function showMonth(ym) {
-  if (mode !== "daily") return;
+  if (mode !== "daily" || searchQuery) return;
   const token = ++loadToken;
   current = null; // 読み込み中・失敗時に旧月を並び順変更で再描画しない
   content.replaceChildren();
@@ -218,12 +228,121 @@ async function loadMonths(token) {
     opt.value = ym;
     select.appendChild(opt);
   }
-  select.disabled = false;
-  orderSelect.disabled = false;
+  syncDailyControls();
   select.addEventListener("change", () => showMonth(select.value));
   orderSelect.addEventListener("change", () => {
     sortOrder = orderSelect.value === "asc" ? "asc" : "desc";
     if (current) renderMonth(current.ym, current.days, sortOrder); // 再取得せず再描画（開閉は最新日のみ展開に戻る）
+  });
+}
+
+// 検索中は月の選択・並び順を無効にする（検索は全期間・新しい順）。
+function syncDailyControls() {
+  const off = Boolean(searchQuery) || !select.options.length;
+  select.disabled = off;
+  orderSelect.disabled = off;
+  searchClear.disabled = !searchInput.value;
+}
+
+// 日刊タブの表示: 検索中なら検索結果、そうでなければ選択中の月（取得済みなら再取得せず再描画）。
+function showDaily() {
+  if (searchQuery) {
+    showSearch();
+  } else if (current) {
+    ++loadToken; // 週刊・月刊・検索の読み込み中の応答で上書きしない
+    setStatus("");
+    renderMonth(current.ym, current.days, sortOrder);
+  } else {
+    startDaily();
+  }
+}
+
+// ---- 日刊の横断検索 -----------------------------------------------------------
+function loadSearchEntries() {
+  if (!searchLoading) {
+    searchLoading = fetchText("data/search-index.json")
+      .then((text) => { searchEntries = buildSearchEntries(JSON.parse(text)); })
+      .catch((e) => { searchLoading = null; throw e; }); // 失敗時は次の検索で再試行する
+  }
+  return searchLoading;
+}
+
+async function showSearch() {
+  const token = ++loadToken;
+  const query = searchQuery;
+  if (searchEntries === null) {
+    content.replaceChildren();
+    setStatus("検索データを読み込み中...");
+    try {
+      await loadSearchEntries();
+    } catch (e) {
+      if (token === loadToken) setStatus("検索データ（data/search-index.json）を取得できませんでした。", true);
+      return;
+    }
+    if (token !== loadToken) return;
+  }
+  renderSearch(query, searchArticles(searchEntries, query));
+}
+
+function renderSearch(query, results) {
+  setStatus("");
+  const frag = document.createDocumentFragment();
+  const head = el("div", "month-head");
+  head.appendChild(el("h2", "", "検索結果"));
+  head.appendChild(el("span", "count", `${results.length}件`));
+  frag.appendChild(head);
+  frag.appendChild(el("p", "search-summary", `「${query}」を全期間の日刊ログから検索（取得日の新しい順）`));
+  if (results.length === 0) {
+    frag.appendChild(el("p", "search-empty",
+      "該当する記事はありません。キーワードを減らすか、別の表記（略称・正式名称など）でお試しください。"));
+    content.replaceChildren(frag);
+    return;
+  }
+  const cards = el("div", "theme-cards search-results");
+  frag.appendChild(cards);
+  const more = el("button", "more");
+  more.type = "button";
+  let shown = 0;
+  const showMore = () => {
+    const next = results.slice(shown, shown + SEARCH_PAGE_SIZE);
+    for (const item of next) cards.appendChild(renderCard(item));
+    shown += next.length;
+    more.hidden = shown >= results.length;
+    more.textContent = `さらに表示（残り${results.length - shown}件）`;
+  };
+  more.addEventListener("click", showMore);
+  showMore();
+  frag.appendChild(more);
+  content.replaceChildren(frag);
+}
+
+function applySearch(value) {
+  clearTimeout(searchTimer);
+  const query = value.trim().replace(/\s+/g, " ");
+  if (query === searchQuery) return; // 空白の追加など、結果が変わらない入力では再描画しない
+  searchQuery = query;
+  syncDailyControls();
+  if (mode === "daily") showDaily(); // 空欄に戻したら通常の日刊表示へ
+}
+
+function initSearch() {
+  searchInput.addEventListener("input", (e) => {
+    syncDailyControls();
+    if (e.isComposing) return; // 日本語入力の変換中は検索しない（確定時に compositionend で検索）
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => applySearch(searchInput.value), SEARCH_DELAY_MS);
+  });
+  searchInput.addEventListener("compositionend", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => applySearch(searchInput.value), SEARCH_DELAY_MS);
+  });
+  searchInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.isComposing) applySearch(searchInput.value);
+  });
+  searchClear.addEventListener("click", () => {
+    searchInput.value = "";
+    applySearch("");
+    searchInput.focus();
   });
 }
 
@@ -374,13 +493,7 @@ function setMode(next, preferred) {
     startReview(next, preferred);
   } else {
     setHash("");
-    if (current) {
-      ++loadToken; // 週刊・月刊の読み込み中の応答で上書きしない
-      setStatus("");
-      renderMonth(current.ym, current.days, sortOrder); // 再取得せず再描画
-    } else {
-      startDaily();
-    }
+    showDaily();
   }
 }
 
@@ -392,6 +505,7 @@ function parseHash(hash) {
 }
 
 function init() {
+  initSearch();
   for (const [name, button] of Object.entries(modeButtons)) {
     button.addEventListener("click", () => { if (mode !== name) setMode(name); });
   }
