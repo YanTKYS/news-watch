@@ -2,7 +2,7 @@
 
 自治体DX・自治体の生成AI活用に関する新着Web情報を、Brave Search APIから定期収集して
 Markdownの時系列ログとして蓄積するツールです。検索結果のタイトル・URL・説明文のみを保存し、
-記事本文の取得は行いません。あわせて、1週間分のログからAIで振り返り記事（週刊レビュー）を生成します。
+記事本文の取得は行いません。あわせて、蓄積したログからAIで振り返り記事（週刊・月刊レビュー）を生成します。
 
 ## セットアップ
 
@@ -10,7 +10,7 @@ Markdownの時系列ログとして蓄積するツールです。検索結果の
 2. GitHubのリポジトリで **Settings → Secrets and variables → Actions** を開き、
    Repository secret として `BRAVE_API_KEY` を登録します（値はAPIキー。コード・ファイルには書かないでください）。
 3. （任意）関連性フィルタを使う場合は、同じ手順で Repository secret `JEV_API_KEY`（Jev APIのキー）も登録します。
-4. （週刊レビュー）同じ手順で Repository secret `GEMINI_API_KEY`（[Google AI Studio](https://aistudio.google.com/) で発行したGemini APIのキー）を登録します。
+4. （週刊・月刊レビュー）同じ手順で Repository secret `GEMINI_API_KEY`（[Google AI Studio](https://aistudio.google.com/) で発行したGemini APIのキー）を登録します。
 5. **Actions** タブでワークフローを有効化します。
 
 ## 実行
@@ -77,14 +77,14 @@ Actionsログに `Topic duplicate candidates` / `Topic duplicate pairs` とし�
 ## 週刊レビュー
 
 毎週月曜（日本時間 8:29 頃）に、前週の月曜〜日曜に取得した記事（`Retrieved` 基準。公開日では絞り込みません）から、
-Google Gemini API（`generateContent`、既定のモデルは `gemini-2.5-flash`）で振り返り記事を生成します
+Google Gemini API（`generateContent`、既定のモデルは `gemini-3.8-flash`）で振り返り記事を生成します
 （`scripts/weekly.py` / `.github/workflows/weekly.yml`）。Brave・Jevは呼び出さず、日刊ログ・`seen.json` は読み取るだけです。
 Google検索などのツールは使いません。
 
 - **API利用量**: 1回の実行で最大1リクエスト（リトライ・自動修復・別モデルへの切り替えなし、タイムアウト180秒）。
   生成済みの週は通常実行ではAPIを呼ばずに終了し、対象週の記事が0件のときも呼びません。
 - **モデルの変更**: **Settings → Secrets and variables → Actions → Variables** に Repository variable `GEMINI_MODEL`
-  （例: `gemini-2.5-flash`）を登録すると、そのモデルを使います。未設定時は `scripts/weekly.py` の `DEFAULT_MODEL` です。
+  （例: `gemini-3.8-flash`）を登録すると、週刊・月刊ともそのモデルを使います。未設定時は `scripts/weekly.py` の `DEFAULT_MODEL` です。
   モデルが利用できない場合（HTTP 404等）は、モデル名・HTTPステータス・エラー概要をログに出して停止します。
 - **入力**: 記事ごとのタイトル・テーマ・Source・Published・Retrieved・説明文（500文字まで）に `article-001` 形式のIDを付けて送ります。
   URL・検索語・月別ログ全体は送りません。最大50件で、超える場合は日付×テーマの偏りが出ないよう選び、
@@ -95,21 +95,42 @@ Google検索などのツールは使いません。
   （`finishReason` が `STOP` 以外）や不正なJSONの場合は保存せず、ワークフローを失敗にします。
   思考トークンは出力上限に含まれるため、思考の上限（`THINKING_BUDGET`）と出力上限（`MAX_OUTPUT_TOKENS`）を分けて設定しています。
   出典リンクは、検証済みのIDに対応する元記事のURL（http/httpsのみ）をPython側で付けます。
-- **出力**: `weekly/YYYY/YYYY-Www.md`（ISO 8601の週番号。年末年始は暦年と異なる年になる場合があります）と、
+- **出力**: `reviews/weekly/YYYY-Www.md`（ISO 8601の週番号。年末年始は暦年と異なる年になる場合があります）と、
   週の一覧 `data/weeks.json`。
 - **手動実行**: Actions → `Weekly review` → Run workflow。`week`（例: `2026-W42`、空欄なら前週）と、
   生成済みの週を上書きする場合のみ `regenerate` を指定します。終了していない週は指定できません。
 - **ローカル実行**（任意）: `GEMINI_API_KEY`（必要なら `GEMINI_MODEL`）を環境変数に設定して
   `python scripts/weekly.py [--week 2026-W42] [--force]`
 
+## 月刊レビュー
+
+毎月1日（日本時間 9:03 頃）に、前月の振り返り記事を生成します（`scripts/monthly.py` / `.github/workflows/monthly.yml`）。
+Gemini APIの設定・モデル・API利用量（1回の実行で最大1リクエスト、リトライ・別モデルへの切り替えなし）・
+出力の検証は週刊と共通です。生成済みの月は通常実行ではAPIを呼ばず、対象月の記事が0件のときも呼びません。
+
+- **入力**: 取得日（`Retrieved`）が対象月の記事（最大150件、説明文は300文字まで）と、対象月に重なる週の週刊レビューの注目トピック。
+  週刊のトピックは、出典がすべて対象月の記事に対応するものだけを渡します（月をまたぐ週の対象月外の記述は使いません）。
+  週刊の概況・まとめは渡しません。週刊が無い週は日刊ログだけで補います。記事が150件を超える場合は、週刊の出典になった記事を優先します。
+- **構成**: 今月の総括／主要トレンド（1〜6件。見出し・説明・自治体実務への示唆・出典）／翌月以降の注目点。
+  出典リンクは、AIが返した記事IDを検証し、対象月の日刊ログにあるURLから付けます。
+- **出力**: `reviews/monthly/YYYY-MM.md` と、月の一覧 `data/review-months.json`（日刊用の `data/months.json` とは別）。
+- **手動実行**: Actions → `Monthly review` → Run workflow。`month`（例: `2026-10`、空欄なら前月）と、
+  生成済みの月を上書きする場合のみ `regenerate` を指定します。終了していない月は指定できません。
+- **ローカル実行**（任意）: `python scripts/monthly.py [--month 2026-10] [--force]`
+- **実行順序**: 週刊・月刊のワークフローは同じ concurrency group で直列に実行します（1日が月曜の日も同時にpushしません）。
+  月刊は実行開始時点の `main` を取得するため、先に完了した週刊も材料にできます。日刊収集とは変更ファイルが重ならず、
+  push前に `git pull --rebase` で取り込みます。
+
 ## GitHub Pagesで読む
 
-ヘッダーの「日刊／週刊」で表示を切り替えます（`index.html` / `parser.js` / `app.js` / `style.css`、アイコンは `favicon.svg`）。
+ヘッダーの「日刊／週刊／月刊」で表示を切り替えます（`index.html` / `parser.js` / `app.js` / `style.css`、アイコンは `favicon.svg`）。
 
 - **日刊**: 収集したログを月ごとのカード形式で表示します。`logs/YYYY/YYYY-MM.md` を読み込むだけで、データの二重管理はありません。
   月の一覧 `data/months.json` は、収集時に `logs/` から自動で更新されます（手作業は不要）。
-- **週刊**: `data/weeks.json` の週を選んで、`weekly/YYYY/YYYY-Www.md` を1カラムの記事として表示します。
+- **週刊**: `data/weeks.json` の週を選んで、`reviews/weekly/YYYY-Www.md` を1カラムの記事として表示します。
   `#weekly/2026-W42` のようなURLで特定の週を直接開けます。
+- **月刊**: `data/review-months.json` の月を選んで、`reviews/monthly/YYYY-MM.md` を同じ1カラムの記事として表示します。
+  `#monthly/2026-10` のようなURLで特定の月を直接開けます。
 
 公開設定: **Settings → Pages → Build and deployment → Deploy from a branch → `main` → `/ (root)`**
 公開URL例: `https://yantkys.github.io/news-watch/`
@@ -119,5 +140,6 @@ Google検索などのツールは使いません。
 ## 実行結果の確認
 
 Actionsのログ末尾に、検索語数・APIリクエスト数・取得件数・新着件数・重複件数が表示されます。
-週刊レビューでは、対象週・元記事数・選択件数・モデル名・APIリクエスト数・トークン数（入力・出力・思考・合計。応答に含まれる場合）・出力先が表示されます。
+週刊・月刊レビューでは、対象期間・元記事数・選択件数・モデル名・APIリクエスト数・トークン数（入力・出力・思考・合計。応答に含まれる場合）・出力先が表示されます。
+月刊では、参照できた週刊レビューの数と、対象月外の出典を含むため除外した週刊トピックの数も表示されます。
 APIキーは表示されません。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""前週（月曜〜日曜）の日刊ログから、AIで週刊レビューを生成して weekly/YYYY/YYYY-Www.md に保存する。
+"""前週（月曜〜日曜）の日刊ログから、AIで週刊レビューを生成して reviews/weekly/YYYY-Www.md に保存する。
 
 - 入力は既存の logs/YYYY/YYYY-MM.md のみ（Brave/Jevの再検索はしない）。取得日 Retrieved で対象週を抽出する。
 - Gemini API（generateContent）は1週につき1リクエスト（リトライ・自動修復・別モデルへの切り替えなし）。
@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # ---- Gemini API（利用量のハードリミット） ----------------------------------------
 API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-DEFAULT_MODEL = "gemini-2.5-flash"  # 環境変数 GEMINI_MODEL で上書きできる（自動フォールバックはしない）
+DEFAULT_MODEL = "gemini-3.8-flash"  # 環境変数 GEMINI_MODEL で上書きできる（自動フォールバックはしない）
 MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,99}$")
 TIMEOUT_SEC = 180
 # 思考トークンは maxOutputTokens に含まれるため、思考の上限を決めた上で、本文（想定1,000〜1,500字の
@@ -142,8 +142,7 @@ def period_label(week: Week) -> str:
 
 
 def output_path(weekly_dir: Path, week: Week) -> Path:
-    y, _ = week.iso
-    return weekly_dir / str(y) / f"{week.label}.md"
+    return weekly_dir / f"{week.label}.md"  # 年はファイル名（ISO週の年）に含むため、年別ディレクトリは作らない
 
 
 # ---- 日刊ログの読み取り -------------------------------------------------------------
@@ -399,13 +398,19 @@ def resolve_model(env: dict) -> str:
 
 
 def build_request(week: Week, articles: list[Article], api_key: str, model: str = DEFAULT_MODEL) -> urllib.request.Request:
-    """generateContent のリクエスト。tools（Google検索等）は指定しない。APIキーはURLではなくヘッダーで渡す。"""
+    return build_gemini_request(SYSTEM_PROMPT, build_user_prompt(week, articles),
+                                response_schema([a.id for a in articles]), api_key, model)
+
+
+def build_gemini_request(system_prompt: str, user_prompt: str, schema: dict, api_key: str,
+                         model: str = DEFAULT_MODEL) -> urllib.request.Request:
+    """generateContent のリクエスト（月刊と共用）。tools（Google検索等）は指定しない。APIキーはURLではなくヘッダーで渡す。"""
     body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": build_user_prompt(week, articles)}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "responseJsonSchema": response_schema([a.id for a in articles]),
+            "responseJsonSchema": schema,
             "maxOutputTokens": MAX_OUTPUT_TOKENS,
             "thinkingConfig": {"thinkingBudget": THINKING_BUDGET},
         },
@@ -478,6 +483,25 @@ def sanitize(text: object, secret: str) -> str:
         text = text.replace(secret, "***")
     text = " ".join("".join(c if c.isprintable() else " " for c in text).split())
     return text if len(text) <= MAX_ERROR_CHARS else text[: MAX_ERROR_CHARS - 1] + "…"
+
+
+def request_gemini(request: urllib.request.Request, api_key: str, model: str, label: str) -> dict | None:
+    """APIを1回だけ呼び、トークン数をログに出す（月刊と共用）。失敗時はエラー概要を出して None。"""
+    print("API requests: 1")
+    try:
+        data = call_api(request)
+    except ValidationError as e:
+        print(f"ERROR: invalid API response; {label} was not saved: {e}", file=sys.stderr)
+        return None
+    except Exception as e:  # リトライ・別モデルへの切り替えはしない。本文・ヘッダ・キーは出力しない。
+        print(f"ERROR: Gemini API request failed (model={model}): {describe_error(e, api_key)}", file=sys.stderr)
+        if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+            print("::warning::モデルが存在しないか利用できない可能性があります。GEMINI_MODEL を確認してください。")
+        return None
+    tokens = usage_tokens(data)
+    if tokens:
+        print("Tokens: " + ", ".join(f"{k}={v}" for k, v in tokens.items()))
+    return data
 
 
 def describe_error(e: Exception, secret: str = "") -> str:
@@ -619,11 +643,10 @@ _WEEK_FILE_RE = re.compile(r"^(\d{4})-W(\d{2})\.md$")
 
 
 def list_weeks(weekly_dir: Path) -> list[dict]:
-    """weekly/YYYY/YYYY-Www.md を走査し、閲覧UI用の週一覧（新しい順）を返す。"""
+    """reviews/weekly/YYYY-Www.md を走査し、閲覧UI用の週一覧（新しい順）を返す。"""
     weeks = []
-    for path in weekly_dir.glob("*/*.md"):
-        m = _WEEK_FILE_RE.match(path.name)
-        if not m or path.parent.name != m.group(1):
+    for path in weekly_dir.glob("*.md"):
+        if not _WEEK_FILE_RE.match(path.name):
             continue
         try:
             w = parse_week(path.stem)
@@ -646,7 +669,7 @@ def run(
     week_arg: str | None = None,
     force: bool = False,
     logs_dir: Path = ROOT / "logs",
-    weekly_dir: Path = ROOT / "weekly",
+    weekly_dir: Path = ROOT / "reviews" / "weekly",
     weeks_path: Path = ROOT / "data" / "weeks.json",
     today: str | None = None,
     env: dict | None = None,
@@ -663,7 +686,7 @@ def run(
         return 2
 
     out = output_path(weekly_dir, week)
-    rel = f"weekly/{out.parent.name}/{out.name}"
+    rel = f"reviews/weekly/{out.name}"
     print(f"Weekly target: {week.label} ({week.start.isoformat()} - {week.end.isoformat()})")
     if out.exists() and not force:
         print(f"Already generated: {rel}; skipped (API requests: 0). Use --force to regenerate.")
@@ -696,20 +719,9 @@ def run(
               "GitHub の Settings → Secrets and variables → Actions で登録してください。", file=sys.stderr)
         return 2
 
-    print("API requests: 1")
-    try:
-        data = call_api(build_request(week, selected, api_key, model))
-    except ValidationError as e:
-        print(f"ERROR: invalid API response; weekly review was not saved: {e}", file=sys.stderr)
+    data = request_gemini(build_request(week, selected, api_key, model), api_key, model, "weekly review")
+    if data is None:
         return 1
-    except Exception as e:  # リトライ・別モデルへの切り替えはしない。本文・ヘッダ・キーは出力しない。
-        print(f"ERROR: Gemini API request failed (model={model}): {describe_error(e, api_key)}", file=sys.stderr)
-        if isinstance(e, urllib.error.HTTPError) and e.code == 404:
-            print("::warning::モデルが存在しないか利用できない可能性があります。GEMINI_MODEL を確認してください。")
-        return 1
-    tokens = usage_tokens(data)
-    if tokens:
-        print("Tokens: " + ", ".join(f"{k}={v}" for k, v in tokens.items()))
     try:
         review = validate_review(extract_text(data), {a.id for a in selected})
     except ValidationError as e:

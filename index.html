@@ -17,6 +17,7 @@
         <div class="mode-switch" role="group" aria-label="表示の切り替え">
           <button type="button" id="mode-daily" aria-pressed="true">日刊</button>
           <button type="button" id="mode-weekly" aria-pressed="false">週刊</button>
+          <button type="button" id="mode-monthly" aria-pressed="false">月刊</button>
         </div>
         <div class="control-set" id="daily-controls">
           <label>
@@ -37,6 +38,12 @@
             <select id="week-select" disabled></select>
           </label>
         </div>
+        <div class="control-set" id="monthly-controls" hidden>
+          <label>
+            <span class="visually-hidden">表示する月（月刊）</span>
+            <select id="review-month-select" disabled></select>
+          </label>
+        </div>
       </div>
     </div>
   </header>
@@ -44,7 +51,7 @@
     <div id="status" role="status" aria-live="polite">読み込み中...</div>
     <div id="content"></div>
   </main>
-  <noscript><p class="wrap">このページの表示にはJavaScriptが必要です。ログは <a href="logs/">logs/</a>、週刊レビューは <a href="weekly/">weekly/</a> のMarkdownで直接読めます。</p></noscript>
+  <noscript><p class="wrap">このページの表示にはJavaScriptが必要です。ログは <a href="logs/">logs/</a>、週刊・月刊レビューは <a href="reviews/">reviews/</a> のMarkdownで直接読めます。</p></noscript>
   <script src="parser.js"></script>
   <script src="app.js"></script>
 </body>

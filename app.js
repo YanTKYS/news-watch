@@ -1,6 +1,6 @@
 "use strict";
-// 閲覧UI。日刊は data/months.json と logs/YYYY/YYYY-MM.md、週刊は data/weeks.json と
-// weekly/YYYY/YYYY-Www.md を相対パスで読み取るだけ。
+// 閲覧UI。日刊は data/months.json と logs/YYYY/YYYY-MM.md、週刊は data/weeks.json と reviews/weekly/YYYY-Www.md、
+// 月刊は data/review-months.json と reviews/monthly/YYYY-MM.md を相対パスで読み取るだけ。
 // 外部由来の文字列は textContent と検証済みURLのhref設定のみで描画する（innerHTML は使わない）。
 
 const MONTH_RE = /^\d{4}-\d{2}$/;
@@ -8,17 +8,50 @@ const WEEK_RE = /^\d{4}-W\d{2}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const select = document.getElementById("month-select");
 const orderSelect = document.getElementById("order-select");
-const weekSelect = document.getElementById("week-select");
 const dailyControls = document.getElementById("daily-controls");
-const weeklyControls = document.getElementById("weekly-controls");
-const modeButtons = { daily: document.getElementById("mode-daily"), weekly: document.getElementById("mode-weekly") };
+const modeButtons = {
+  daily: document.getElementById("mode-daily"),
+  weekly: document.getElementById("mode-weekly"),
+  monthly: document.getElementById("mode-monthly"),
+};
 const statusEl = document.getElementById("status");
 const content = document.getElementById("content");
-let loadToken = 0; // 連続切替時に古い応答で上書きしない（日刊・週刊で共通）
+let loadToken = 0; // 連続切替時に古い応答で上書きしない（日刊・週刊・月刊で共通）
 let sortOrder = "desc"; // "desc"=新しい順 / "asc"=古い順（月を切り替えても維持。永続化はしない）
 let current = null; // 表示中の月 { ym, days }。並び順変更時の再描画に使う
-let mode = "daily"; // "daily" | "weekly"
-let weeks = null; // data/weeks.json の内容（初めて週刊を開いたときに読む）
+let mode = "daily"; // "daily" | "weekly" | "monthly"
+
+// 週刊・月刊の設定。一覧（index）は初めてそのタブを開いたときに読む。
+const REVIEWS = {
+  weekly: {
+    index: "data/weeks.json",
+    key: "week",
+    keyRe: WEEK_RE,
+    path: (id) => `reviews/weekly/${id}.md`,
+    title: (id) => weekLabel(id),
+    option: (e) => `${weekLabel(e.week)}（${rangeLabel(e.start, e.end)}）`,
+    name: "週刊レビュー",
+    listName: "週の一覧",
+    empty: "週刊レビューはまだありません。毎週月曜日に、前週分のレビューを掲載します。",
+    select: document.getElementById("week-select"),
+    controls: document.getElementById("weekly-controls"),
+    entries: null,
+  },
+  monthly: {
+    index: "data/review-months.json",
+    key: "month",
+    keyRe: MONTH_RE,
+    path: (id) => `reviews/monthly/${id}.md`,
+    title: (id) => monthLabel(id),
+    option: (e) => monthLabel(e.month),
+    name: "月刊レビュー",
+    listName: "月の一覧",
+    empty: "月刊レビューはまだありません。毎月1日に、前月分のレビューを掲載します。",
+    select: document.getElementById("review-month-select"),
+    controls: document.getElementById("monthly-controls"),
+    entries: null,
+  },
+};
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -194,29 +227,29 @@ async function loadMonths(token) {
   });
 }
 
-// ---- 週刊 -----------------------------------------------------------------
+// ---- 週刊・月刊 -------------------------------------------------------------
 function paragraphsOf(parent, texts, className) {
   for (const t of texts) parent.appendChild(el("p", className, t));
 }
 
-function renderWeekly(entry, review) {
+function renderReview(cfg, entry, review) {
   const article = el("article", "weekly");
   const head = el("header", "weekly-head");
   if (review.title) head.appendChild(el("p", "weekly-kicker", review.title));
-  head.appendChild(el("h2", "", weekLabel(entry.week)));
+  head.appendChild(el("h2", "", cfg.title(entry[cfg.key])));
   head.appendChild(el("p", "weekly-period", `対象期間：${review.period || rangeLabel(entry.start, entry.end)}`));
   article.appendChild(head);
 
   if (review.overview.length) {
     const sec = el("section", "weekly-section");
-    sec.appendChild(el("h3", "", "今週の概況"));
+    sec.appendChild(el("h3", "", review.headings.overview));
     paragraphsOf(sec, review.overview);
     article.appendChild(sec);
   }
 
   if (review.topics.length) {
     const sec = el("section", "weekly-section");
-    sec.appendChild(el("h3", "", "注目トピック"));
+    sec.appendChild(el("h3", "", review.headings.topics));
     review.topics.forEach((topic, i) => {
       const block = el("section", "topic");
       block.appendChild(el("h4", "topic-title", `${i + 1}. ${topic.title}`));
@@ -251,7 +284,7 @@ function renderWeekly(entry, review) {
 
   if (review.closing.length) {
     const sec = el("section", "weekly-section");
-    sec.appendChild(el("h3", "", "今週のまとめ"));
+    sec.appendChild(el("h3", "", review.headings.closing));
     paragraphsOf(sec, review.closing);
     article.appendChild(sec);
   }
@@ -264,83 +297,85 @@ function renderWeekly(entry, review) {
   content.replaceChildren(article);
 }
 
-async function showWeek(week) {
-  const entry = weeks && weeks.find((w) => w.week === week);
-  if (!entry || mode !== "weekly") return;
+async function showReview(kind, id) {
+  const cfg = REVIEWS[kind];
+  const entry = cfg.entries && cfg.entries.find((e) => e[cfg.key] === id);
+  if (!entry || mode !== kind) return;
   const token = ++loadToken;
   content.replaceChildren();
   setStatus("読み込み中...");
-  setHash(`weekly/${week}`);
+  setHash(`${kind}/${id}`);
   let text;
   try {
-    text = await fetchText(`weekly/${week.slice(0, 4)}/${week}.md`);
+    text = await fetchText(cfg.path(id));
   } catch (e) {
-    if (token === loadToken) setStatus(`${weekLabel(week)}の週刊レビューを取得できませんでした。`, true);
+    if (token === loadToken) setStatus(`${cfg.title(id)}の${cfg.name}を取得できませんでした。`, true);
     return;
   }
   if (token !== loadToken) return;
-  const review = parseWeekly(text);
+  const review = parseReview(text);
   if (!review.overview.length && !review.topics.length) {
-    setStatus(`${weekLabel(week)}の週刊レビューを表示できませんでした。`, true);
+    setStatus(`${cfg.title(id)}の${cfg.name}を表示できませんでした。`, true);
     return;
   }
   setStatus("");
-  renderWeekly(entry, review);
+  renderReview(cfg, entry, review);
 }
 
-async function startWeekly(preferred) {
+async function startReview(kind, preferred) {
+  const cfg = REVIEWS[kind];
   const token = ++loadToken;
   content.replaceChildren();
-  if (weeks === null) {
+  if (cfg.entries === null) {
     setStatus("読み込み中...");
     let list;
     try {
-      const data = JSON.parse(await fetchText("data/weeks.json"));
+      const data = JSON.parse(await fetchText(cfg.index));
       if (!Array.isArray(data)) throw new Error("not an array");
-      list = data.filter((w) => w && WEEK_RE.test(w.week) && DATE_RE.test(w.start) && DATE_RE.test(w.end));
+      list = data.filter((e) => e && cfg.keyRe.test(e[cfg.key]) && DATE_RE.test(e.start) && DATE_RE.test(e.end));
     } catch (e) {
-      if (token === loadToken) setStatus("週の一覧（data/weeks.json）を取得できませんでした。", true);
-      return;
+      if (token === loadToken) setStatus(`${cfg.listName}（${cfg.index}）を取得できませんでした。`, true);
+      return; // 次にタブを開いたときに再試行する
     }
-    if (weeks === null) {
-      weeks = list;
-      for (const w of weeks) {
-        const opt = el("option", "", `${weekLabel(w.week)}（${rangeLabel(w.start, w.end)}）`);
-        opt.value = w.week;
-        weekSelect.appendChild(opt);
+    if (cfg.entries === null) {
+      cfg.entries = list;
+      for (const e of list) {
+        const opt = el("option", "", cfg.option(e));
+        opt.value = e[cfg.key];
+        cfg.select.appendChild(opt);
       }
-      weekSelect.disabled = weeks.length === 0;
+      cfg.select.disabled = list.length === 0;
     }
   }
   if (token !== loadToken) return;
-  if (weeks.length === 0) {
-    setStatus("週刊レビューはまだありません。毎週月曜日に、前週分のレビューを掲載します。");
+  if (cfg.entries.length === 0) {
+    setStatus(cfg.empty);
     return;
   }
-  if (preferred && weeks.some((w) => w.week === preferred)) weekSelect.value = preferred;
-  showWeek(weekSelect.value || weeks[0].week); // weeks.json は新しい順。先頭=最新週
+  if (preferred && cfg.entries.some((e) => e[cfg.key] === preferred)) cfg.select.value = preferred;
+  showReview(kind, cfg.select.value || cfg.entries[0][cfg.key]); // 一覧は新しい順。先頭=最新
 }
 
-// ---- 日刊／週刊の切り替え（URLの #weekly/2026-W42 で週刊を直接開ける） ----------------
+// ---- 日刊／週刊／月刊の切り替え（#weekly/2026-W42・#monthly/2026-10 で直接開ける） -----------
 function setHash(value) {
   const url = value ? `#${value}` : location.pathname + location.search;
   if (location.hash !== (value ? `#${value}` : "")) history.replaceState(null, "", url);
 }
 
-function setMode(next, preferredWeek) {
+function setMode(next, preferred) {
   mode = next;
   for (const [name, button] of Object.entries(modeButtons)) {
     button.setAttribute("aria-pressed", String(name === next));
   }
   dailyControls.hidden = next !== "daily";
-  weeklyControls.hidden = next !== "weekly";
-  if (next === "weekly") {
-    setHash("weekly");
-    startWeekly(preferredWeek);
+  for (const [kind, cfg] of Object.entries(REVIEWS)) cfg.controls.hidden = next !== kind;
+  if (REVIEWS[next]) {
+    setHash(next);
+    startReview(next, preferred);
   } else {
     setHash("");
     if (current) {
-      ++loadToken; // 週刊の読み込み中の応答で上書きしない
+      ++loadToken; // 週刊・月刊の読み込み中の応答で上書きしない
       setStatus("");
       renderMonth(current.ym, current.days, sortOrder); // 再取得せず再描画
     } else {
@@ -349,12 +384,22 @@ function setMode(next, preferredWeek) {
   }
 }
 
+function parseHash(hash) {
+  const m = /^#(weekly|monthly)(?:\/([0-9A-Za-z-]+))?$/.exec(hash);
+  if (!m) return { mode: "daily", id: null };
+  const id = m[2] && REVIEWS[m[1]].keyRe.test(m[2]) ? m[2] : null;
+  return { mode: m[1], id };
+}
+
 function init() {
-  modeButtons.daily.addEventListener("click", () => { if (mode !== "daily") setMode("daily"); });
-  modeButtons.weekly.addEventListener("click", () => { if (mode !== "weekly") setMode("weekly"); });
-  weekSelect.addEventListener("change", () => showWeek(weekSelect.value));
-  const m = /^#weekly(?:\/(\d{4}-W\d{2}))?$/.exec(location.hash);
-  setMode(m ? "weekly" : "daily", m && m[1]);
+  for (const [name, button] of Object.entries(modeButtons)) {
+    button.addEventListener("click", () => { if (mode !== name) setMode(name); });
+  }
+  for (const [kind, cfg] of Object.entries(REVIEWS)) {
+    cfg.select.addEventListener("change", () => showReview(kind, cfg.select.value));
+  }
+  const target = parseHash(location.hash);
+  setMode(target.mode, target.id);
 }
 
 init();

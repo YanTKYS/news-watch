@@ -1,0 +1,78 @@
+name: Monthly review
+
+# 前月の日刊ログ（logs/）と週刊レビュー（reviews/weekly/）から月刊レビューを生成する。Brave/Jev APIは使わない。
+# Gemini APIは1回の実行で最大1リクエスト（リトライ・別モデルへの切り替えなし）。生成済みの月は regenerate 指定時のみ再生成する。
+# モデルは Repository variable GEMINI_MODEL で変更できる（未設定なら scripts/weekly.py の既定値）。
+# トリガーは schedule と workflow_dispatch のみ（Secretを使うため pull_request 等では実行しない）。
+on:
+  schedule:
+    # 毎月1日 JST 09:03（UTC 1日 00:03）
+    - cron: "3 0 1 * *"
+  workflow_dispatch:
+    inputs:
+      month:
+        description: "対象月（例: 2026-10）。空欄なら前月"
+        required: false
+        default: ""
+      regenerate:
+        description: "生成済みでも再生成する（APIを1回呼びます）"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+# 週刊（weekly.yml）と同じグループで直列にする。1日が月曜の日は、先に動いた週刊の完了を待ってから実行する。
+concurrency:
+  group: reviews
+  cancel-in-progress: false
+
+jobs:
+  monthly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # 待機中に週刊がpushした内容も材料にできるよう、トリガー時点ではなく実行時点のブランチ先頭を取得する
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate monthly review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          MONTH: ${{ inputs.month }}
+          REGENERATE: ${{ inputs.regenerate }}
+        run: |
+          args=()
+          if [ -n "$MONTH" ]; then args+=(--month "$MONTH"); fi
+          if [ "$REGENERATE" = "true" ]; then args+=(--force); fi
+          python scripts/monthly.py "${args[@]}"
+
+      - name: Commit and push if the monthly review changed
+        run: |
+          git add data/review-months.json
+          if [ -d reviews/monthly ]; then git add reviews/monthly; fi
+          if git diff --cached --quiet; then
+            echo "No changes; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: monthly review $(TZ=Asia/Tokyo date +%F)"
+          # 日刊収集が先にpushしていても取り込めるようにする（変更ファイルは重ならない）
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push && exit 0
+            sleep $((i * 5))
+          done
+          echo "push failed" >&2
+          exit 1
