@@ -48,7 +48,7 @@ body {
   letter-spacing: 0;
   line-height: 1.45;
 }
-.lead { margin: 4px 0 20px; color: var(--muted); font-size: 1rem; }
+.lead { margin: 4px 0 20px; color: var(--muted); font-size: 1rem; text-wrap: balance; }
 /* 操作エリア。flex-wrap任せにせず、画面幅ごとに行構成を固定する（高さはすべて44px）。
    〜719px: タブ（全幅）→ 月 → 並び順 → 検索欄（それぞれ1行）
    720〜1099px: 1行目にタブ、2行目に表示中のタブの操作（日刊は 月｜並び順｜検索欄）
