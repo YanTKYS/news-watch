@@ -122,6 +122,9 @@
   "https://prtimes.jp/main/html/rd/p/000000014.000068645.html": {
     "first_seen": "2026-09-30"
   },
+  "https://prtimes.jp/main/html/rd/p/000000017.000068645.html": {
+    "first_seen": "2026-10-19"
+  },
   "https://prtimes.jp/main/html/rd/p/000000030.000149029.html": {
     "first_seen": "2026-10-14"
   },
@@ -184,6 +187,9 @@
   },
   "https://www.digital.go.jp/policies/genai": {
     "first_seen": "2026-10-03"
+  },
+  "https://www.digital.go.jp/policies/health/public-medical-hub": {
+    "first_seen": "2026-10-19"
   },
   "https://www.digital.go.jp/policies/local_governments": {
     "first_seen": "2026-10-04"
