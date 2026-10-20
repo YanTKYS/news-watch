@@ -1,4 +1,7 @@
 {
+  "https://373news.com/lifestyle/info/pr_times/detail/000000014.000068645.html": {
+    "first_seen": "2026-10-20"
+  },
   "https://ai.watch.impress.co.jp/docs/news/2144107.html": {
     "first_seen": "2026-09-30"
   },
@@ -37,6 +40,9 @@
   },
   "https://carview.yahoo.co.jp/news/detail/b2bf2163a98dc4f4d0c7b056dfdeca067931bf20?mode=top": {
     "first_seen": "2026-09-30"
+  },
+  "https://cloud.watch.impress.co.jp/docs/news/2147952.html": {
+    "first_seen": "2026-10-20"
   },
   "https://coplus-one.jp/jichitai-seisei-ai": {
     "first_seen": "2026-09-30"
@@ -86,6 +92,9 @@
   "https://kyotango.kyoto-fsci.or.jp/news/p13954": {
     "first_seen": "2026-10-02"
   },
+  "https://maniken.jp/news/3904": {
+    "first_seen": "2026-10-20"
+  },
   "https://matsubara-city.note.jp/n/nce3542598b32?gs=1604b13109352a07598f2418f9d568a1": {
     "first_seen": "2026-09-30"
   },
@@ -134,6 +143,12 @@
   "https://prtimes.jp/main/html/rd/p/000000395.000023654.html": {
     "first_seen": "2026-10-15"
   },
+  "https://prtimes.jp/main/html/rd/p/000000401.000132312.html": {
+    "first_seen": "2026-10-20"
+  },
+  "https://prtimes.jp/main/html/rd/p/000000405.000132312.html": {
+    "first_seen": "2026-10-20"
+  },
   "https://prtimes.jp/main/html/rd/p/000000527.000007306.html": {
     "first_seen": "2026-10-15"
   },
@@ -169,6 +184,9 @@
   },
   "https://webtiger.jp/jichitai-genai": {
     "first_seen": "2026-10-12"
+  },
+  "https://www.47news.jp/15094062.html": {
+    "first_seen": "2026-10-20"
   },
   "https://www.at-s.com/feed/article/pr_times/2067199.html": {
     "first_seen": "2026-10-05"
@@ -206,8 +224,17 @@
   "https://www.excite.co.jp/news/article/impress_watch_1477803680855408707": {
     "first_seen": "2026-10-04"
   },
+  "https://www.hokkaido-np.co.jp/article/1391521": {
+    "first_seen": "2026-10-20"
+  },
+  "https://www.hokkaido-np.co.jp/article/1392066": {
+    "first_seen": "2026-10-20"
+  },
   "https://www.itmedia.co.jp/business/articles/2609/24/news015.html": {
     "first_seen": "2026-10-01"
+  },
+  "https://www.itmedia.co.jp/business/articles/2610/19/news064.html": {
+    "first_seen": "2026-10-20"
   },
   "https://www.iza.ne.jp/pressrelease/prtimes/7VPB7Y6DNRM7TF5ALG3OGB2XUA": {
     "first_seen": "2026-09-30"
@@ -223,6 +250,9 @@
   },
   "https://www.jt-tsushin.jp/articles/case/casestudy_dx-6": {
     "first_seen": "2026-10-11"
+  },
+  "https://www.niigata-nippo.co.jp/articles/-/925498": {
+    "first_seen": "2026-10-20"
   },
   "https://www.nikkei.com/article/DGXZQOFC2570K0V20C26A9000000": {
     "first_seen": "2026-09-30"
