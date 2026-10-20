@@ -4,7 +4,7 @@
 - 対象記事は日刊ログの取得日（Retrieved）が対象月に含まれるもの。出典リンクはこの記事のURLからのみ付与する。
 - 週刊レビューは主な材料として使うが、出典がすべて対象月の記事に対応するトピックだけを渡す
   （月をまたぐ週の、対象月外の記述が混入しないようにする）。週刊が無い週は日刊ログだけで補う。
-- Gemini API・認証・モデル指定・エラー処理は weekly.py と共通（1回につき1リクエスト、リトライ・別モデルへの切り替えなし）。
+- Gemini API・認証・モデル指定・エラー処理・再試行は weekly.py と共通（通常1リクエスト。一時的なエラーに限り1回だけ再試行し、最大2回。別モデルへの切り替えなし）。
 - 日刊ログ・週刊レビューは読み取りのみで、変更しない。
 """
 from __future__ import annotations
@@ -425,20 +425,34 @@ def run(
     env: dict | None = None,
 ) -> int:
     env = os.environ if env is None else env
+    summary = weekly.RunSummary()
+    try:
+        return _run(summary, month_arg, force, logs_dir, weekly_dir, monthly_dir, index_path, today, env)
+    except Exception as e:  # 想定外の例外でも実行サマリーに残す（例外はそのまま再送出する）
+        summary.note = type(e).__name__
+        raise
+    finally:
+        weekly.write_step_summary("Monthly review", summary, env)
+
+
+def _run(summary, month_arg, force, logs_dir, weekly_dir, monthly_dir, index_path, today, env) -> int:
     today_d = date.fromisoformat(today) if today else datetime.now(weekly.JST).date()
     try:
-        model = weekly.resolve_model(env)
+        model = summary.model = weekly.resolve_model(env)
         month = parse_month(month_arg) if month_arg else previous_month(today_d)
         if month.end >= today_d:
             raise WeeklyError(f"{month.label} はまだ終わっていません（対象は終了した月のみ）")
     except WeeklyError as e:
+        summary.note = str(e)
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    summary.target, summary.mode = month.label, "再生成" if force else ("指定月生成" if month_arg else "通常生成")
     out = monthly_dir / f"{month.label}.md"
     rel = f"reviews/monthly/{out.name}"
     print(f"Monthly target: {month.label} ({month.start.isoformat()} - {month.end.isoformat()})")
     if out.exists() and not force:
+        summary.mode, summary.result = "生成済みスキップ", "成功"
         print(f"Already generated: {rel}; skipped (API requests: 0). Use --force to regenerate.")
         update_index(index_path, monthly_dir)
         return 0
@@ -447,12 +461,14 @@ def run(
         # 取得日（Retrieved）が対象月に含まれる記事。公開日では絞り込まない。
         articles, invalid = weekly.load_week_articles(logs_dir, month)
     except WeeklyError as e:
+        summary.note = str(e)
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
     print(f"Source articles: {len(articles)}")
     if invalid:
         print(f"::warning::Unreadable log entries in the month files (skipped): {invalid}")
     if not articles:
+        summary.mode, summary.result = "記事なしスキップ", "成功"
         print("No articles in the target month; skipped (API requests: 0).")
         return 0
 
@@ -461,6 +477,7 @@ def run(
     print(f"Weekly reviews: {len(weeks) - len(missing)} of {len(weeks)}"
           + (f" (missing: {', '.join(missing)}; daily logs are used instead)" if missing else ""))
     selected = select_articles(articles, topics)
+    summary.articles = len(selected)
     pairs = weekly.assign_ids(selected)
     topics = attach_topic_ids(topics, selected)
     print(f"Weekly topics used: {len(topics)} (excluded, citing articles outside the month: {excluded})")
@@ -472,16 +489,19 @@ def run(
 
     api_key = (env.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
+        summary.note = "GEMINI_API_KEY が未設定です"
         print("ERROR: 環境変数 GEMINI_API_KEY が設定されていません。"
               "GitHub の Settings → Secrets and variables → Actions で登録してください。", file=sys.stderr)
         return 2
 
-    data = weekly.request_gemini(build_request(month, selected, topics, api_key, model), api_key, model, "monthly review")
+    data = weekly.request_gemini(build_request(month, selected, topics, api_key, model), api_key, model, "monthly review",
+                                 summary.api)
     if data is None:
         return 1
     try:
         review = validate_review(weekly.extract_text(data), {a.id for a in selected})
     except ValidationError as e:
+        summary.api.error = f"invalid API output: {weekly.sanitize(e, api_key)}"
         print(f"ERROR: invalid API output; monthly review was not saved: {weekly.sanitize(e, api_key)}", file=sys.stderr)
         return 1
 
@@ -489,6 +509,7 @@ def run(
     used_weeks = len({t.week for t in topics})
     weekly.write_atomic(out, render_markdown(month, review, by_id, len(articles), used_weeks, today_d, model))
     update_index(index_path, monthly_dir)
+    summary.result = "成功"
     print(f"Trends: {len(review.trends)}")
     print(f"Output: {rel}")
     return 0
@@ -497,7 +518,7 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="前月の日刊ログと週刊レビューから月刊レビューを生成する")
     parser.add_argument("--month", help="対象月（例: 2026-10）。省略時は前月")
-    parser.add_argument("--force", action="store_true", help="生成済みの月を再生成する（APIを1回呼ぶ）")
+    parser.add_argument("--force", action="store_true", help="生成済みの月を再生成する（APIを通常1回呼ぶ）")
     args = parser.parse_args(argv)
     return run(month_arg=(args.month or "").strip() or None, force=args.force)
 
