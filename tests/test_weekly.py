@@ -97,8 +97,12 @@ class Base(unittest.TestCase):
         self.logs = d / "logs"
         self.weekly_dir = d / "reviews" / "weekly"
         self.weeks = d / "data" / "weeks.json"
+        sleep = mock.patch.object(weekly.time, "sleep")  # 再試行の待機で実際には眠らない
+        self.sleep = sleep.start()
+        self.addCleanup(sleep.stop)
 
-    def run_weekly(self, responder, today="2026-10-19", week=None, force=False, env=None):
+    def run_weekly(self, responder, today="2026-10-19", week="2026-W42", force=False, env=None):
+        """week 省略時は 2026-W42 を明示指定（欠号補完の判定を受けない）。自動選択は week=None で確認する。"""
         env = {"GEMINI_API_KEY": SECRET} if env is None else env
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(weekly.urllib.request, "urlopen", side_effect=responder) as m, \
@@ -345,7 +349,7 @@ class RunFlow(Base):
             m.assert_not_called()
             self.assertIn("GEMINI_API_KEY", err)
 
-    def test_api_error_does_not_retry_or_touch_logs(self):
+    def test_transient_api_error_retries_once_and_does_not_touch_logs(self):
         self.week42()
         log = self.logs / "2026" / "2026-10.md"
         before = log.read_bytes()
@@ -354,7 +358,7 @@ class RunFlow(Base):
         for e in errors:
             code, m, out, err = self.run_weekly(mock.Mock(side_effect=e))
             self.assertEqual(code, 1)
-            self.assertEqual(m.call_count, 1)  # リトライしない
+            self.assertEqual(m.call_count, weekly.MAX_API_ATTEMPTS)  # 再試行は1回まで（合計2回）
             self.assertNotIn(SECRET, out + err)
             self.assertEqual(log.read_bytes(), before)
             self.assertFalse(self.output().exists())
@@ -394,13 +398,17 @@ class GeminiResponse(Base):
     def go(self, payload_or_error, env=None, force=False):
         def responder(req, timeout=None):
             self.urls.append(req.full_url)
+            if isinstance(payload_or_error, urllib.error.HTTPError):  # 再試行でも本文を読めるよう、毎回作り直す
+                raise urllib.error.HTTPError(req.full_url, payload_or_error.code, "error", {}, io.BytesIO(error_body))
             if isinstance(payload_or_error, Exception):
                 raise payload_or_error
             return FakeResponse(payload_or_error)
 
+        error_body = payload_or_error.fp.getvalue() if isinstance(payload_or_error, urllib.error.HTTPError) else b""
+
         self.urls = []
         result = self.run_weekly(responder, env=env, force=force)
-        self.assertLessEqual(result[1].call_count, 1)  # 1回だけ（リトライ・別モデルでの再試行なし）
+        self.assertLessEqual(result[1].call_count, weekly.MAX_API_ATTEMPTS)  # 再試行を含めて最大2回
         self.assertNotIn(SECRET, result[2] + result[3])
         return result
 
@@ -456,7 +464,8 @@ class GeminiResponse(Base):
         for status, body in bodies.items():
             code, m, out, err = self.go(http_error(status, body))
             self.assertEqual(code, 1)
-            self.assertEqual(self.urls, [GEMINI_URL])  # 別モデルへのフォールバックなし
+            self.assertEqual(m.call_count, 2 if status == 429 else 1)  # 429のみ再試行（400/403/404は再試行しない）
+            self.assertEqual(set(self.urls), {GEMINI_URL})  # 別モデルへのフォールバックなし
             line = next(ln for ln in err.splitlines() if ln.startswith("ERROR: Gemini API request failed"))
             self.assertIn(f"model=gemini-3.8-flash): HTTP {status} status={body['error']['status']}", line)
             self.assertLess(len(line), 400)
@@ -493,6 +502,335 @@ class GeminiResponse(Base):
         code, m, out, _ = self.run_weekly(lambda *a, **k: self.fail("called"))
         self.assertEqual((code, m.call_count), (0, 0))
         self.assertIn("API requests: 0", out)
+
+
+# ---- 一時的なエラーの再試行 ---------------------------------------------------------------
+class Retry(Base):
+    def sequence(self, *items):
+        """呼び出しごとに items を順に返す（例外は raise、それ以外は正常応答）。使い切ったら失敗させる。"""
+        queue = list(items)
+
+        def responder(req, timeout=None):
+            item = queue.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return FakeResponse(item)
+
+        return responder
+
+    def go(self, *items, **kw):
+        self.week42()
+        return self.run_weekly(self.sequence(*items), **kw)
+
+    def assert_no_leak(self, out, err):
+        self.assertNotIn(SECRET, out + err)
+        self.assertNotIn("自治体ニュース記事", out + err)  # リクエスト本文（記事情報）は出さない
+        self.assertNotIn("x-goog-api-key", (out + err).lower())
+
+    def test_success_on_first_request_does_not_retry(self):
+        code, m, out, err = self.go(completion(review()))
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.sleep.assert_not_called()
+        self.assertIn("API attempt 1/2: model=gemini-3.8-flash status=200", out)
+        self.assertIn("API requests: 1", out)
+        self.assert_no_leak(out, err)
+
+    def test_503_then_success_takes_two_requests(self):
+        body = {"error": {"code": 503, "status": "UNAVAILABLE", "message": f"overloaded {SECRET}"}}
+        code, m, out, err = self.go(http_error(503, body, secret_in_message=True), completion(review()))
+        self.assertEqual((code, m.call_count), (0, 2), err)
+        self.sleep.assert_called_once_with(weekly.RETRY_WAIT_SEC)
+        self.assertTrue(self.output().exists())
+        self.assertIn("API attempt 1/2: model=gemini-3.8-flash status=503", out)
+        self.assertIn("retry=yes", out)
+        self.assertIn("API attempt 2/2: model=gemini-3.8-flash status=200", out)
+        self.assertIn("API requests: 2", out)
+        self.assertIn("retrying once", out)
+        self.assertIn("HTTP 503 status=UNAVAILABLE", out)
+        self.assert_no_leak(out, err)
+
+    def test_timeout_then_success_takes_two_requests(self):
+        code, m, out, err = self.go(TimeoutError(SECRET), completion(review()))
+        self.assertEqual((code, m.call_count), (0, 2), err)
+        self.assertIn("status=timeout", out)
+        self.assertIn("API requests: 2", out)
+        self.assert_no_leak(out, err)
+
+    def test_all_transient_failures_are_retried(self):
+        failures = [http_error(c, {}) for c in (429, 500, 502, 503, 504)] + [
+            urllib.error.URLError(TimeoutError("timed out")), urllib.error.URLError(ConnectionRefusedError()),
+            ConnectionResetError(), weekly.http.client.RemoteDisconnected("closed"),
+            weekly.http.client.IncompleteRead(b"x")]
+        for e in failures:
+            with self.subTest(error=repr(e)):
+                code, m, _, err = self.go(e, completion(review()))
+                self.assertEqual((code, m.call_count), (0, 2), err)
+                self.output().unlink()
+
+    def test_permanent_errors_are_not_retried(self):
+        import ssl
+        failures = [http_error(c, {"error": {"status": "X"}}) for c in (400, 401, 403, 404, 413)] + [
+            urllib.error.URLError(ssl.SSLCertVerificationError("bad cert"))]
+        for e in failures:
+            with self.subTest(error=repr(e)):
+                self.sleep.reset_mock()
+                code, m, out, err = self.go(e)
+                self.assertEqual((code, m.call_count), (1, 1))
+                self.sleep.assert_not_called()
+                self.assertIn("retry=no", out)
+                self.assertIn("API requests: 1", out)
+                self.assertFalse(self.output().exists())
+
+    def test_stops_after_second_failure(self):
+        code, m, out, err = self.go(http_error(503, {"error": {"status": "UNAVAILABLE"}}), TimeoutError())
+        self.assertEqual((code, m.call_count), (1, 2))
+        self.sleep.assert_called_once()
+        self.assertIn("API requests: 2", out)
+        self.assertIn("API attempt 2/2: model=gemini-3.8-flash status=timeout", out)
+        self.assertIn("retry=no", out.splitlines()[[i for i, ln in enumerate(out.splitlines()) if "attempt 2/2" in ln][0]])
+        self.assertIn("ERROR: Gemini API request failed (model=gemini-3.8-flash): TimeoutError", err)
+        self.assertFalse(self.output().exists())
+        self.assertFalse(self.weeks.exists())
+
+    def test_invalid_response_is_not_retried(self):
+        for payload in (b"<html>", completion("{broken"), {"candidates": []}):
+            code, m, _, _ = self.go(payload, completion(review()))
+            self.assertEqual((code, m.call_count), (1, 1))
+            self.sleep.assert_not_called()
+
+    def test_no_retry_when_it_would_exceed_the_time_budget(self):
+        self.week42()
+        clock = iter([0, 0, 300, 300])  # 初回に300秒かかった → 待機＋再試行で上限を超える
+        with mock.patch.object(weekly.time, "monotonic", side_effect=lambda: next(clock)):
+            code, m, out, _ = self.run_weekly(self.sequence(TimeoutError(), completion(review())))
+        self.assertEqual((code, m.call_count), (1, 1))
+        self.assertIn("retry=no", out)
+
+    def test_worst_case_fits_in_the_workflow_timeout(self):
+        import yaml
+        worst = 2 * weekly.TIMEOUT_SEC + weekly.RETRY_WAIT_SEC
+        self.assertLessEqual(worst, weekly.API_BUDGET_SEC)
+        self.assertEqual(weekly.MAX_API_ATTEMPTS, 2)
+        self.assertEqual(weekly.TIMEOUT_SEC, 180)  # 根拠なく延長しない
+        for name in ("weekly", "monthly"):
+            wf = yaml.safe_load((ROOT / f".github/workflows/{name}.yml").read_text(encoding="utf-8"))
+            minutes = next(iter(wf["jobs"].values()))["timeout-minutes"]
+            self.assertLess(weekly.API_BUDGET_SEC + 120, minutes * 60, name)  # 環境構築・commitの余裕を残す
+
+
+# ---- 欠号の自動補完 ------------------------------------------------------------------
+class BackfillFixture(Base):
+    """today=2026-10-26（月）の定期実行。確認範囲は W40〜W43（前週は W43）。"""
+    TODAY = "2026-10-26"
+    DAYS = {"2026-W39": "2026-09-22", "2026-W40": "2026-10-01", "2026-W41": "2026-10-06",
+            "2026-W42": "2026-10-13", "2026-W43": "2026-10-20"}
+
+    def logs_for(self, *labels):
+        by_month = {}
+        for i, label in enumerate(labels):
+            day = self.DAYS[label]
+            by_month.setdefault(day[:7], []).append(entry(day, f"{label}の自治体ニュース記事{i}",
+                                                          f"https://a.example.jp/{label}"))
+        for ym, entries in by_month.items():
+            write_month(self.logs, ym, entries)
+
+    def existing(self, *labels):
+        self.weekly_dir.mkdir(parents=True, exist_ok=True)
+        for label in labels:
+            (self.output(label)).write_text(f"既存の{label}\n", encoding="utf-8")
+
+    def go(self, week=None, force=False, env=None, responder=None):
+        responder = responder or (lambda *a, **k: FakeResponse(completion(review())))
+        return self.run_weekly(responder, today=self.TODAY, week=week, force=force, env=env)
+
+    def files(self):
+        return sorted(p.stem for p in self.weekly_dir.glob("*.md")) if self.weekly_dir.exists() else []
+
+
+class Backfill(BackfillFixture):
+    def test_backfill_window_is_the_last_four_finished_weeks_oldest_first(self):
+        window = weekly.backfill_weeks(date(2026, 10, 26))
+        self.assertEqual([w.label for w in window], ["2026-W40", "2026-W41", "2026-W42", "2026-W43"])
+        self.assertEqual(window[-1], weekly.previous_week(date(2026, 10, 26)))
+        self.assertEqual([w.label for w in weekly.backfill_weeks(date(2027, 1, 4))],
+                         ["2026-W50", "2026-W51", "2026-W52", "2026-W53"])  # 2026年はISO週が53週まである
+        self.assertEqual([w.label for w in weekly.backfill_weeks(date(2027, 1, 18))],
+                         ["2026-W52", "2026-W53", "2027-W01", "2027-W02"])  # 年をまたいでも連続する
+
+    def test_normal_generation_when_only_the_previous_week_is_missing(self):
+        self.logs_for("2026-W41", "2026-W42", "2026-W43")
+        self.existing("2026-W41", "2026-W42")
+        code, m, out, err = self.go()
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertEqual(self.files(), ["2026-W41", "2026-W42", "2026-W43"])
+        self.assertIn("[通常生成]", out)
+
+    def test_missing_week_is_backfilled_and_marked(self):
+        self.logs_for("2026-W41", "2026-W42", "2026-W43")
+        self.existing("2026-W41")
+        code, m, out, err = self.go()
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertIn("Weekly target: 2026-W42", out)
+        self.assertIn("[欠号補完]", out)
+        self.assertTrue(self.output("2026-W42").exists())
+        self.assertFalse(self.output("2026-W43").exists())  # 前週は次回以降（1回の実行で最大1週）
+
+    def test_oldest_missing_week_comes_first_and_only_one_per_run(self):
+        self.logs_for("2026-W40", "2026-W41", "2026-W42", "2026-W43")
+        self.existing("2026-W41")
+        order = []
+        for _ in range(4):
+            code, m, out, err = self.go()
+            self.assertEqual(code, 0, err)
+            self.assertLessEqual(m.call_count, 1)
+            order.append(self.files())
+        self.assertEqual(order, [["2026-W40", "2026-W41"], ["2026-W40", "2026-W41", "2026-W42"],
+                                 ["2026-W40", "2026-W41", "2026-W42", "2026-W43"],
+                                 ["2026-W40", "2026-W41", "2026-W42", "2026-W43"]])  # 4回目は生成済みスキップ（API 0回）
+
+    def test_generated_reviews_are_never_overwritten(self):
+        self.logs_for("2026-W40", "2026-W41", "2026-W42", "2026-W43")
+        self.existing("2026-W40", "2026-W41", "2026-W42", "2026-W43")
+        code, m, out, _ = self.go(responder=lambda *a, **k: self.fail("called"))
+        self.assertEqual((code, m.call_count), (0, 0))
+        self.assertIn("API requests: 0", out)
+        for label in ("2026-W40", "2026-W41", "2026-W42", "2026-W43"):
+            self.assertEqual(self.output(label).read_text(encoding="utf-8"), f"既存の{label}\n")
+        self.assertEqual([e["week"] for e in json.loads(self.weeks.read_text(encoding="utf-8"))],
+                         ["2026-W43", "2026-W42", "2026-W41", "2026-W40"])
+
+    def test_weeks_without_articles_are_skipped_without_api_and_do_not_block(self):
+        self.logs_for("2026-W42")  # W40・W41・W43 は記事なし・未生成
+        code, m, out, err = self.go()
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertEqual(self.files(), ["2026-W42"])
+        self.assertIn("no articles (skipped): 2026-W40, 2026-W41", out)
+
+    def test_nothing_to_do_when_no_week_has_articles(self):
+        write_month(self.logs, "2026-10", [entry("2026-10-26", "対象外の記事", "https://a.example.jp/x")])
+        code, m, out, _ = self.go(responder=lambda *a, **k: self.fail("called"))
+        self.assertEqual((code, m.call_count), (0, 0))
+        self.assertIn("API requests: 0", out)
+        self.assertEqual(self.files(), [])
+
+    def test_weeks_older_than_the_window_are_not_generated(self):
+        self.logs_for("2026-W39")
+        code, m, out, _ = self.go(responder=lambda *a, **k: self.fail("called"))
+        self.assertEqual((code, m.call_count), (0, 0))
+        self.assertEqual(self.files(), [])
+
+    def test_manual_week_overrides_backfill(self):
+        self.logs_for("2026-W40", "2026-W41", "2026-W42", "2026-W43")  # W40 は欠号だが対象にしない
+        code, m, out, err = self.go(week="2026-W42")
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertEqual(self.files(), ["2026-W42"])
+        self.assertNotIn("Backfill", out)
+        self.assertIn("[指定週生成]", out)
+
+    def test_manual_week_older_than_the_window_is_allowed(self):
+        self.logs_for("2026-W39")
+        code, m, _, err = self.go(week="2026-W39")
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertEqual(self.files(), ["2026-W39"])
+
+    def test_manual_existing_week_is_skipped_unless_regenerate(self):
+        self.logs_for("2026-W40", "2026-W42")
+        self.existing("2026-W42")
+        code, m, out, _ = self.go(week="2026-W42", responder=lambda *a, **k: self.fail("called"))
+        self.assertEqual((code, m.call_count), (0, 0))
+        self.assertEqual(self.output("2026-W42").read_text(encoding="utf-8"), "既存の2026-W42\n")
+        code, m, out, err = self.go(week="2026-W42", force=True)  # regenerate=true の明示指定
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertIn("## 今週の概況", self.output("2026-W42").read_text(encoding="utf-8"))
+        self.assertFalse(self.output("2026-W40").exists())
+
+    def test_regenerate_without_week_targets_the_previous_week_only(self):
+        self.logs_for("2026-W40", "2026-W43")
+        self.existing("2026-W43")
+        code, m, out, err = self.go(force=True)
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertIn("Weekly target: 2026-W43", out)
+        self.assertFalse(self.output("2026-W40").exists())
+
+    def test_failed_backfill_stays_missing_and_is_retried_next_run(self):
+        self.logs_for("2026-W42", "2026-W43")
+        failing = mock.Mock(side_effect=http_error(503, {"error": {"status": "UNAVAILABLE"}}))
+        code, m, _, _ = self.go(responder=failing)
+        self.assertEqual((code, m.call_count), (1, 2))  # 再試行を含めて最大2回
+        self.assertEqual(self.files(), [])
+        code, m, out, err = self.go()
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertEqual(self.files(), ["2026-W42"])
+
+    def test_unreadable_log_stops_before_api(self):
+        self.logs_for("2026-W42")
+        (self.logs / "2026" / "2026-10.md").write_bytes(b"\xff\xfe")
+        code, m, _, err = self.go(responder=lambda *a, **k: self.fail("called"))
+        self.assertEqual((code, m.call_count), (1, 0))
+        self.assertIn("日刊ログを読み込めません", err)
+
+
+# ---- 実行サマリー（GitHub Step Summary） --------------------------------------------------
+class StepSummary(BackfillFixture):
+    def summary_env(self, event="schedule"):
+        self.summary_path = Path(self.tmp.name) / "summary.md"
+        return {"GEMINI_API_KEY": SECRET, "GITHUB_STEP_SUMMARY": str(self.summary_path), "GITHUB_EVENT_NAME": event}
+
+    def text(self):
+        return self.summary_path.read_text(encoding="utf-8")
+
+    def test_scheduled_backfill_summary(self):
+        self.logs_for("2026-W41", "2026-W42", "2026-W43")
+        self.existing("2026-W41")
+        usage = {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+        code, m, _, err = self.go(env=self.summary_env(), responder=self.seq(
+            http_error(503, {"error": {"status": "UNAVAILABLE", "message": f"busy {SECRET}"}}), completion(review(), usage=usage)))
+        self.assertEqual(code, 0, err)
+        text = self.text()
+        for expected in ("### Weekly review", "| 対象 | 2026-W42 |", "| 実行種別 | 定期 |", "| 区分 | 欠号補完 |",
+                         "| 入力記事数 | 1件 |", "| 利用モデル | gemini-3.8-flash |", "| APIリクエスト回数 | 2回", "| 結果 | 成功 |",
+                         "total=15", "| 再試行 | 初回失敗（HTTP 503 status=UNAVAILABLE message=busy ***）のため1回再試行 |"):
+            self.assertIn(expected, text)
+        self.assertNotIn(SECRET, text)
+
+    def seq(self, *items):
+        return Retry.sequence(self, *items)
+
+    def test_manual_failure_summary_has_error_overview(self):
+        self.logs_for("2026-W42")
+        code, m, _, _ = self.go(week="2026-W42", env=self.summary_env("workflow_dispatch"),
+                                responder=self.seq(TimeoutError(SECRET), TimeoutError(SECRET)))
+        self.assertEqual(code, 1)
+        text = self.text()
+        for expected in ("| 実行種別 | 手動 |", "| 区分 | 指定週生成 |", "| APIリクエスト回数 | 2回（最終結果: timeout",
+                         "| 結果 | 失敗 |", "| エラー概要 | TimeoutError |"):
+            self.assertIn(expected, text)
+        self.assertNotIn(SECRET, text)
+
+    def test_skip_summaries(self):
+        self.logs_for("2026-W42")
+        self.existing("2026-W42")
+        self.go(week="2026-W42", env=self.summary_env(), responder=lambda *a, **k: self.fail("called"))
+        for expected in ("| 区分 | 生成済みスキップ |", "| APIリクエスト回数 | 0回 |", "| 結果 | 成功 |"):
+            self.assertIn(expected, self.text())
+        self.go(env=self.summary_env(), responder=lambda *a, **k: self.fail("called"))  # 前週以外は記事なし・W42は生成済み
+        self.assertIn("| APIリクエスト回数 | 0回 |", self.text())
+
+    def test_invalid_week_summary_and_no_summary_file_without_env(self):
+        code, *_ = self.go(week="2026-W99", env=self.summary_env())
+        self.assertEqual(code, 2)
+        self.assertIn("| 結果 | 失敗 |", self.text())
+        self.assertIn("存在しない週です", self.text())
+        self.logs_for("2026-W42")
+        code, *_ = self.go(env={"GEMINI_API_KEY": SECRET})  # GITHUB_STEP_SUMMARY が無ければ何も書かない
+        self.assertEqual(code, 0)
+
+    def test_unwritable_summary_does_not_fail_generation(self):
+        self.logs_for("2026-W42")
+        env = {"GEMINI_API_KEY": SECRET, "GITHUB_STEP_SUMMARY": str(Path(self.tmp.name) / "no" / "dir" / "s.md")}
+        code, m, out, err = self.go(env=env)
+        self.assertEqual(code, 0, err)
+        self.assertIn("Could not write the step summary", out)
 
 
 # ---- 出力の検証 ------------------------------------------------------------------

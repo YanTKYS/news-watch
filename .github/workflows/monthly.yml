@@ -1,7 +1,8 @@
 name: Monthly review
 
 # 前月の日刊ログ（logs/）と週刊レビュー（reviews/weekly/）から月刊レビューを生成する。Brave/Jev APIは使わない。
-# Gemini APIは1回の実行で最大1リクエスト（リトライ・別モデルへの切り替えなし）。生成済みの月は regenerate 指定時のみ再生成する。
+# Gemini APIは通常1リクエスト。一時的なエラー（429/5xx・タイムアウト）に限り1回だけ再試行する（最大2リクエスト、別モデルへの切り替えなし）。
+# 生成済みの月は regenerate 指定時のみ再生成する。実行結果は実行サマリーに出力する。
 # モデルは Repository variable GEMINI_MODEL で変更できる（未設定なら scripts/weekly.py の既定値）。
 # トリガーは schedule と workflow_dispatch のみ（Secretを使うため pull_request 等では実行しない）。
 on:
@@ -15,7 +16,7 @@ on:
         required: false
         default: ""
       regenerate:
-        description: "生成済みでも再生成する（APIを1回呼びます）"
+        description: "生成済みでも再生成する（APIを通常1回、一時的なエラー時は最大2回呼びます）"
         type: boolean
         required: false
         default: false

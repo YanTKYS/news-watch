@@ -57,6 +57,9 @@ class Base(unittest.TestCase):
         self.monthly_dir = d / "reviews" / "monthly"
         self.index = d / "data" / "review-months.json"
         self.requests = []
+        sleep = mock.patch.object(weekly.time, "sleep")  # 再試行の待機で実際には眠らない
+        self.sleep = sleep.start()
+        self.addCleanup(sleep.stop)
 
     def run_monthly(self, responder=None, today="2026-11-01", month=None, force=False, env=None):
         env = {"GEMINI_API_KEY": SECRET} if env is None else env
@@ -71,7 +74,7 @@ class Base(unittest.TestCase):
                 redirect_stdout(out), redirect_stderr(err):
             code = monthly.run(month_arg=month, force=force, logs_dir=self.logs, weekly_dir=self.weekly_dir,
                                monthly_dir=self.monthly_dir, index_path=self.index, today=today, env=env)
-        self.assertLessEqual(m.call_count, 1)  # 月刊1回につき最大1リクエスト
+        self.assertLessEqual(m.call_count, weekly.MAX_API_ATTEMPTS)  # 月刊1回につき、再試行を含めて最大2リクエスト
         self.assertNotIn(SECRET, out.getvalue() + err.getvalue())
         return code, m, out.getvalue(), err.getvalue()
 
@@ -325,9 +328,9 @@ class RunFlow(Base):
             self.assertFalse(self.index.exists())
             self.assertEqual({p: p.read_bytes() for p in inputs}, inputs)  # 日刊ログ・週刊レビューは変更しない
 
-    def test_http_errors_stop_without_retry(self):
+    def test_permanent_http_errors_stop_without_retry(self):
         self.october()
-        for status in (400, 403, 404, 429):
+        for status in (400, 401, 403, 404):
             body = {"error": {"code": status, "status": "X_STATUS", "message": f"failure for {SECRET}"}}
             code, m, out, err = self.run_monthly(mock.Mock(side_effect=http_error(status, body)))
             self.assertEqual((code, m.call_count), (1, 1))
@@ -335,9 +338,44 @@ class RunFlow(Base):
             self.assertIn("***", err)
             self.assertFalse(self.output().exists())
         self.assertIn("GEMINI_MODEL を確認してください", self.run_monthly(mock.Mock(side_effect=http_error(404, {})))[2])
-        code, m, _, err = self.run_monthly(mock.Mock(side_effect=TimeoutError()))
-        self.assertEqual((code, m.call_count), (1, 1))
-        self.assertIn("TimeoutError", err)
+        self.sleep.assert_not_called()
+
+    def test_transient_errors_retry_once_then_stop(self):
+        self.october()
+        for error in (TimeoutError(), http_error(503, {"error": {"status": "UNAVAILABLE"}})):
+            code, m, out, err = self.run_monthly(mock.Mock(side_effect=error))
+            self.assertEqual((code, m.call_count), (1, 2))
+            self.assertIn("API requests: 2", out)
+            self.assertFalse(self.output().exists())
+        self.assertIn("TimeoutError", self.run_monthly(mock.Mock(side_effect=TimeoutError()))[3])
+
+    def test_503_then_success_generates_with_two_requests(self):
+        self.october()
+        replies = [http_error(503, {"error": {"status": "UNAVAILABLE"}}), FakeResponse(completion(trends_review()))]
+
+        def responder(req, timeout=None):
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        code, m, out, err = self.run_monthly(responder)
+        self.assertEqual((code, m.call_count), (0, 2), err)
+        self.assertTrue(self.output().exists())
+        self.assertIn("API requests: 2", out)
+
+    def test_step_summary(self):
+        self.october()
+        path = Path(self.tmp.name) / "summary.md"
+        env = {"GEMINI_API_KEY": SECRET, "GITHUB_STEP_SUMMARY": str(path), "GITHUB_EVENT_NAME": "workflow_dispatch"}
+        code, *_ = self.run_monthly(self.ok(), env=env)
+        text = path.read_text(encoding="utf-8")
+        self.assertEqual(code, 0)
+        for expected in ("### Monthly review", "| 対象 | 2026-10 |", "| 実行種別 | 手動 |", "| APIリクエスト回数 | 1回", "| 結果 | 成功 |"):
+            self.assertIn(expected, text)
+        code, *_ = self.run_monthly(mock.Mock(side_effect=http_error(403, {})), env=env, force=True)
+        self.assertEqual(code, 1)
+        self.assertIn("| 結果 | 失敗 |", path.read_text(encoding="utf-8"))
 
 
 # ---- 出力の検証・Markdown ------------------------------------------------------------

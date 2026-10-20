@@ -1,7 +1,9 @@
 name: Weekly review
 
-# 前週の日刊ログ（logs/）から週刊レビューを生成する。Brave/Jev APIは使わない。
-# Gemini APIは1回の実行で最大1リクエスト（リトライ・別モデルへの切り替えなし）。生成済みの週は regenerate 指定時のみ再生成する。
+# 直近の日刊ログ（logs/）から週刊レビューを生成する。Brave/Jev APIは使わない。
+# 1回の実行で生成するのは最大1週。週を指定しない場合は、直近4週のうち未生成で最も古い週（記事のある週）を選ぶ（欠号補完）。
+# Gemini APIは通常1リクエスト。一時的なエラー（429/5xx・タイムアウト）に限り1回だけ再試行する（最大2リクエスト、別モデルへの切り替えなし）。
+# 生成済みの週は regenerate 指定時のみ再生成する。実行結果（対象週・区分・APIリクエスト回数など）は実行サマリーに出力する。
 # モデルは Repository variable GEMINI_MODEL で変更できる（未設定なら scripts/weekly.py の既定値）。
 # トリガーは schedule と workflow_dispatch のみ（Secretを使うため pull_request 等では実行しない）。
 on:
@@ -11,11 +13,11 @@ on:
   workflow_dispatch:
     inputs:
       week:
-        description: "対象週（ISO 8601、例: 2026-W42）。空欄なら前週"
+        description: "対象週（ISO 8601、例: 2026-W42）。指定した週だけを処理（欠号補完なし）。空欄なら直近の未生成週を自動選択"
         required: false
         default: ""
       regenerate:
-        description: "生成済みでも再生成する（APIを1回呼びます）"
+        description: "生成済みでも再生成する（APIを通常1回、一時的なエラー時は最大2回呼びます。週が空欄なら前週）"
         type: boolean
         required: false
         default: false
