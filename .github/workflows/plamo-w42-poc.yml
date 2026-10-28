@@ -1,0 +1,62 @@
+name: PLaMo W42 PoC
+
+# Never trigger paid requests on schedules, pushes or pull requests.
+on:
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: Send one paid PLaMo request (false = offline preparation only)
+        type: boolean
+        required: true
+        default: false
+      spec_confirmed:
+        description: Official schema, model and response specifications checked per README
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plamo-w42-poc
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Require specification review before executing
+        if: ${{ inputs.execute && !inputs.spec_confirmed }}
+        run: |
+          echo 'Verify the official API specification before executing; API requests: 0.'
+          exit 1
+      - name: Prepare without API
+        if: ${{ !inputs.execute }}
+        run: python scripts/plamo_weekly_poc.py --run-name "actions-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Execute exactly once
+        if: ${{ inputs.execute && inputs.spec_confirmed }}
+        env:
+          PLAMO_API_KEY: ${{ secrets.PLAMO_API_KEY }}
+        run: python scripts/plamo_weekly_poc.py --execute --spec-confirmed --run-name "actions-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Collect safe comparison artifacts even on API failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plamo-w42-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            experiments/plamo-w42/runs/actions-${{ github.run_id }}-${{ github.run_attempt }}/input-manifest.json
+            experiments/plamo-w42/runs/actions-${{ github.run_id }}-${{ github.run_attempt }}/metrics.json
+            experiments/plamo-w42/runs/actions-${{ github.run_id }}-${{ github.run_attempt }}/report.md
+            experiments/plamo-w42/runs/actions-${{ github.run_id }}-${{ github.run_attempt }}/candidate.md
+          if-no-files-found: warn
+          retention-days: 14

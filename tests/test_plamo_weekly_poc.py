@@ -52,11 +52,11 @@ class PlamoPoC(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.out = Path(self.tmp.name) / "runs"
 
-    def run_poc(self, *, response=None, error=None, execute=True, env=None, name="test"):
+    def run_poc(self, *, response=None, error=None, execute=True, spec_confirmed=True, env=None, name="test"):
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(poc, "open_once", return_value=Response(completion() if response is None else response),
                                side_effect=error) as call, redirect_stdout(stdout), redirect_stderr(stderr):
-            code = poc.run(execute=execute, output_root=self.out, run_name=name,
+            code = poc.run(execute=execute, spec_confirmed=spec_confirmed, output_root=self.out, run_name=name,
                            env={"PLAMO_API_KEY": KEY} if env is None else env)
         files = {p.name: p.read_text() for p in (self.out / name).glob("*") if p.is_file()}
         output = stdout.getvalue() + stderr.getvalue() + "".join(files.values())
@@ -95,12 +95,20 @@ class PlamoPoC(unittest.TestCase):
         call.assert_not_called()
         self.assertFalse(files)
 
+    def test_unconfirmed_spec_never_calls_even_with_key(self):
+        code, call, files, output = self.run_poc(spec_confirmed=False)
+        self.assertEqual(code, 2)
+        call.assert_not_called()
+        self.assertFalse(files)
+        self.assertIn("--spec-confirmed", output)
+
     def test_success_links_only_to_validated_inputs(self):
         code, call, files, _ = self.run_poc()
         self.assertEqual(code, 0)
         call.assert_called_once()
         metrics = json.loads(files["metrics.json"])
         self.assertEqual((metrics["api_requests"], metrics["http_status"], metrics["validation"]), (1, 200, "passed"))
+        self.assertTrue(metrics["spec_confirmed"])
         self.assertEqual(metrics["usage"]["total_tokens"], 150)
         manifest = json.loads(files["input-manifest.json"])
         self.assertIn(weekly.md_url(manifest["articles"][0]["url"]), files["candidate.md"])

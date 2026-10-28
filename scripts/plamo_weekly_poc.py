@@ -131,12 +131,16 @@ def write_json(path: Path, value) -> None:
     weekly.write_atomic(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
-def run(*, execute=False, logs_dir=weekly.ROOT / "logs", output_root=OUTPUT_ROOT,
+def run(*, execute=False, spec_confirmed=False, logs_dir=weekly.ROOT / "logs", output_root=OUTPUT_ROOT,
         env=None, run_name=None) -> int:
     env = os.environ if env is None else env
     key = (env.get("PLAMO_API_KEY") or "").strip()
     if execute and not key:
         print("ERROR: PLAMO_API_KEY is not set; API requests: 0", file=sys.stderr)
+        return 2
+    if execute and not spec_confirmed:
+        print("ERROR: verify the official API specification before using --spec-confirmed; API requests: 0",
+              file=sys.stderr)
         return 2
     name = run_name or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", name):
@@ -150,7 +154,7 @@ def run(*, execute=False, logs_dir=weekly.ROOT / "logs", output_root=OUTPUT_ROOT
         write_json(out / "input-manifest.json", manifest)
         metrics = {"week": WEEK, "model": MODEL, "api_requests": 0, "http_status": None,
                    "elapsed_seconds": 0, "status": "not_run", "validation": "not_run",
-                   "stage": "not_run", "usage": {}}
+                   "stage": "not_run", "usage": {}, "spec_confirmed": bool(execute and spec_confirmed)}
         write_json(out / "metrics.json", metrics)
     except weekly.WeeklyError:
         print("ERROR: W42 input is missing, invalid or differs from the comparison baseline; API requests: 0",
@@ -236,9 +240,10 @@ def run(*, execute=False, logs_dir=weekly.ROOT / "logs", output_root=OUTPUT_ROOT
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true", help="send exactly one PLaMo request (no retries)")
+    parser.add_argument("--spec-confirmed", action="store_true", help="confirm official specification was checked")
     parser.add_argument("--run-name", help="new run directory name; existing runs cannot be overwritten")
     args = parser.parse_args()
-    return run(execute=args.execute, run_name=args.run_name)
+    return run(execute=args.execute, spec_confirmed=args.spec_confirmed, run_name=args.run_name)
 
 
 if __name__ == "__main__":
