@@ -1,5 +1,7 @@
 # PLaMo W42比較PoC（Issue #19）
 
+**2026-10-28に実APIで1回生成成功・比較評価完了。** 計測値、品質比較、採用判断は [evaluation.md](evaluation.md) を参照。本READMEは実行手順と設計上の制限を記録する。今回の成功だけで長期安定性や全Schema制約のAPI側強制を保証するものではない。
+
 対象は `plamo-3.1-prime` と2026-W42（10月12〜18日）の15記事だけ。本番切替・Geminiフォールバック・月刊・W40の検証は行わない。本番スクリプトと生成物は変更しない。
 
 ## 実行
@@ -32,7 +34,7 @@ gh workflow run plamo-w42-poc.yml --repo YanTKYS/news-watch \
   --ref feat/plamo-w42-poc -f execute=true -f spec_confirmed=true
 ```
 
-このコマンドは有料APIを呼ぶ手動操作であり、今回の修正作業では実行していない。各runに一意の名前を使い、APIステップの失敗時も `always()` で `input-manifest.json`、`metrics.json`、`report.md` と成功時のみ存在する `candidate.md` をArtifactにする。キー未設定等の送信前失敗でファイルがなければアップロードは警告のみとなり、ジョブは失敗のまま残る。生応答やエラー本文、ディレクトリ全体はアップロードしない。保持期間は14日。ワークフローは読み取り権限のみで、生成物のcommit/pushは行わない。
+このコマンドは有料APIを呼ぶ可能性がある手動操作。初期実装時は未実行だったが、2026-10-28にmainから1回実行し成功した（[Actions #40685507441](https://github.com/YanTKYS/news-watch/actions/runs/40685507441)）。再実行は別途判断する。各runに一意の名前を使い、APIステップの失敗時も `always()` で `input-manifest.json`、`metrics.json`、`report.md` と成功時のみ存在する `candidate.md` をArtifactにする。キー未設定等の送信前失敗でファイルがなければアップロードは警告のみとなり、ジョブは失敗のまま残る。生応答やエラー本文、ディレクトリ全体はアップロードしない。保持期間は14日。ワークフローは読み取り権限のみで、生成物のcommit/pushは行わない。
 
 ArtifactはActionsの実行画面または以下で取得し、APIを再実行せず比較する。
 
@@ -41,13 +43,13 @@ gh run download RUN_ID --repo YanTKYS/news-watch \
   --name plamo-w42-RUN_ID-RUN_ATTEMPT --dir /tmp/plamo-w42-results
 ```
 
-### PRマージ前の実API検証
+### PRマージ前の実API検証（初期レビュー時の検討記録）
 
-**新規の `workflow_dispatch` ワークフローは、デフォルトブランチに登録されるまで手動起動できない。** `--ref` を指定するだけではこの制約は解消しない。今回はワークフローをmainへ直接配置したり、PR全体を検証目的でマージしたりしない。
+**新規の `workflow_dispatch` ワークフローは、デフォルトブランチに登録されるまで手動起動できない。** `--ref` を指定するだけではこの制約は解消しない。初期PRレビュー時は、検証のためだけにワークフローをmainへ直接配置したり、PR全体を先行マージしたりしない方針だった。実際にはPR #20を検証基盤としてマージした後、main上の手動ワークフローを利用した。
 
-優先する経路は、PLaMoへ接続できる信頼済みローカル環境でこのPRブランチをチェックアウトし、公式仕様を照合後、環境変数でキーを渡して上記の `--execute --spec-confirmed` を1回だけ実行すること。結果の4ファイルを確認し、Git管理対象外のrunから必要な測定値と評価だけを `evaluation.md` に転記する。
+当初の代替案は、PLaMoへ接続できる信頼済みローカル環境でPRブランチをチェックアウトし、公式仕様を照合後、環境変数でキーを渡して `--execute --spec-confirmed` を1回だけ実行することだった。結果の4ファイルを確認し、Git管理対象外のrunから必要な測定値と評価だけを `evaluation.md` に転記する。
 
-ローカル実行ができずActionsを使う場合は、この手動専用ワークフローだけを先に配置する別PRをレビュー・マージしてから、PoCコードのあるブランチを `--ref` に指定する。先行配置自体はAPIを呼ばない。先行PRの作成・マージと実API起動はまだ行っていない。どちらもできない間は本PRをDraft・検証未完了のまま保つ。
+ローカル実行ができずActionsを使う場合は、この手動専用ワークフローだけを先に配置する別PRをレビュー・マージしてから、PoCコードのあるブランチを `--ref` に指定する。先行配置自体はAPIを呼ばない。この代替案は採用せず、PR #20マージ後の通常の手動Actions実行で検証を完了した。
 
 ## 出力
 
@@ -68,7 +70,7 @@ Issue記載のChat Completions形式を採用し、既存の `weekly.response_sc
 
 公式資料: <https://docs.plamo.preferredai.jp/ja/api>
 
-2026-10-28時点のこの環境では、公式資料へのCONNECTがプロキシの403で拒否された。レビュー対応時にも適用済み接続許可は `api.github.com` のみでPLaMoキーはなく、仕様との照合は未完了。以下は実行前に公式API仕様・利用例で確認する一覧であり、確認済みサポート一覧ではない。
+初期実装・レビュー時のクラウド環境では、公式資料へのCONNECTがプロキシの403で拒否され、利用可能なPLaMoキーもなく、仕様との照合は未完了だった。**その後、GitHub Actionsの実API実行は成功している。** 以下は初期レビュー時の確認項目と防御的なPython側検証を記録した表であり、API側で全制約の強制を実証した一覧ではない。
 
 | 項目 | PoCでの送信・受入条件 | 公式照合 | Python側の検証・制限 |
 | --- | --- | --- | --- |
@@ -82,6 +84,6 @@ Issue記載のChat Completions形式を採用し、既存の `weekly.response_sc
 | 応答 | choices 1件、`finish_reason=stop` | モデル別表記は未確認 | 不完全出力、拒否、ツール呼出を拒否 |
 | usage | prompt/completion/total_tokens | 定義・価格は未確認 | 非負整数のみ記録、モデル間単純比較はしない |
 
-現時点で削除・緩和したスキーマ制約はなく、manifestの `schema_adjustments` は空。上記のPython検証は二重検査であり、API側が未知の制約を受け付ける根拠にはしない。公式照合で調整が必要と判明した場合にだけPoCの変換部分を変更し、削除・緩和した制約、公式根拠、その代替となるPython検証をこの表・評価記録・manifestに記載する。Gemini側は変更しない。実際のPLaMo応答が構造・出典検証を通ることは依然未確認で、フラグ追加やモック成功をもって完了扱いにしない。
+現時点で削除・緩和したスキーマ制約はなく、manifestの `schema_adjustments` は空。上記のPython検証は二重検査であり、API側が未知の制約を受け付ける根拠にはしない。公式照合で調整が必要と判明した場合にだけPoCの変換部分を変更し、削除・緩和した制約、公式根拠、その代替となるPython検証をこの表・評価記録・manifestに記載する。Gemini側は変更しない。実際のPLaMo応答は2026-10-28の1回の実行で構造・出典検証を通過した。一方、全スキーマ制約をAPI側だけで強制できるかは未検証のため、Python側検証は維持する。評価結果は [evaluation.md](evaluation.md) に記録した。
 
 比較状況と評価項目は [evaluation.md](evaluation.md) を参照。
