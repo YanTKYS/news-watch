@@ -1,44 +1,69 @@
 # Sarashina 2026-10-29 再検証の記録
 
-記録日: 2026-10-29（日本時間）
+記録日：2026-10-29（日本時間）  
+対象：[Issue #24](https://github.com/YanTKYS/news-watch/issues/24)
 
-**検証未実施。Phase 1の実装とモック検証を用意した段階。実API試行は0回であり、旧403の解消・継続は不明。Phase 2のW42生成は未実施・未実装。**
+**結論：Phase 1の再検証を完了。新モデル `sarashina3.2-mini-thinking` でもGitHubホストランナーからHTTP 403が発生し、旧検証と同じレスポンスヘッダーの特徴が再現した。GitHub ActionsからのSarashina API利用は今回も確認できず、Phase 2（W42の品質比較）には進まない。** 拒否の仕組みは特定していない。
 
-## 比較基準
+## 背景・比較基準
 
-旧結果は [devlog PR #14](https://github.com/YanTKYS/devlog/pull/14) の `notes/free-apis.md` に基づく。2026-10-17頃、GitHub Actionsの `ubuntu-latest` から `sarashina3-mini` の最小チャットと週刊形式を送信したところ、いずれもHTTP 403、Content-Type text/html、Server awselb/2.0、本文118バイト。Windows実機の成功は作者の報告で、同じキー・同じリクエストかは確認されていない。拒否原因は未確定。
+- 以前の検証（2026-10-17頃）：`sarashina3-mini` をGitHub Actions `ubuntu-latest` から呼び出し、最小チャットと週刊形式の双方で **HTTP 403 / Content-Type: text/html / Server: awselb/2.0**。当時のHTML本文は118バイト。参照：[devlog PR #14](https://github.com/YanTKYS/devlog/pull/14) の `notes/free-apis.md`。
+- Windows実機では接続できたとの報告があるが、使用キー・同一リクエスト・送信環境の完全一致は確認できていない。この差から拒否原因を断定しない。
+- 2026-10-29のSarashinaアップデート後、新モデル `sarashina3.2-mini-thinking` でのアクセス可否を独立PoCから再検証。実験実装は [PR #25](https://github.com/YanTKYS/news-watch/pull/25) で追加した。
 
-今回は新モデル `sarashina3.2-mini-thinking` の最小チャットを最初に検査する。上記の旧結果から、新モデルや同じ送信元の結果を推定しない。
+## Phase 1：実行結果と証跡
 
-## Phase 1 実測値（手動実行後に追記）
-
-| 項目 | 新モデルのチャット | 旧モデルのチャット | GET /v1/models |
-| --- | --- | --- | --- |
-| 実行URL・時刻 | 未実施 | 未実施 | 未実施 |
-| OS / runner | 未計測 | 未計測 | 未計測 |
-| HTTP / Content-Type / Server | 未取得 | 未取得 | 未取得 |
-| 完了したチャット本文の有無 | 未確認 | 未確認 | 該当なし |
-| 所要時間 | 未計測 | 未計測 | 未計測 |
-| 送信試行回数 | 0 | 0 | 0 |
-
-公式サイトはこのクラウド環境の通信制限で取得できず、仕様照合は未完了。キーの有無を推測して試験はせず、キー設定と実測は手動Actionsで行う。実行の前提・上限・Artifact回収は [README](README.md) に記載した。
-
-実装検証: Linux / Python 3.12.14 / Node.js v24.19.0、基準main `22ea238`。既存219件＋新規20件の全239テストが成功し、スキップなし。キーがある場合も既定でAPIを呼ばないこと、未設定キー、HTML/JSONのHTTPエラー、タイムアウト、不正/未完了応答、送信上限、機密情報非露出、出力分離、手動限定イベントをモックで確認した。CLIの準備実行とキーなし送信拒否はともにAPI試行0回。actionlint 1.7.12のワークフロー検査・文書リンク検査も成功。Actions自体は未起動で、これらは実サービスの疎通証跡ではない。
-
-記録時は、JSON形式の認証/レート制限エラーと、ロードバランサ由来に見えるHTML 403をヘッダーに基づき区別する。同じヘッダーが出ても旧本文の同一性や特定の拒否原因を断定しない。401/403ならキーの発行元・利用権限・送信元制限を提供元に確認する等、観測と仮説を分けて次の確認事項を残す。キーや応答本文は転記しない。
-
-## Phase 2へ進む条件
-
-GitHub Actionsの新モデルがHTTP 200で、非空の `choices[0].message.content` と `finish_reason=stop` を満たした実行証跡を確認すること。GET成功やローカル成功のみでは進まない。新モデルの失敗時はW42を送信せず、Phase 1の結果を残して終了する。
-
-成功時には後続PRで独立したW42生成を準備し、別の手動実行でAPIを1回だけ呼ぶ。現時点でその自動ジョブや候補出力は追加していない。
-
-| Phase 2の評価項目 | 状況 |
+| 項目 | 結果 |
 | --- | --- |
-| 入力15記事・固定W42 | 未実施 |
-| Schema・出典ID・候補Markdown | 未検証 |
-| reasoning effort・上限・usage・応答時間 | 未計測 |
-| 日本語・トピック選定・実務への示唆・根拠のない断定 | 未評価 |
-| [Gemini W42](../../reviews/weekly/2026-W42.md) / [PLaMo評価](../plamo-w42/evaluation.md)との比較 | 未評価 |
+| 準備実行 | [Actions #40859124895](https://github.com/YanTKYS/news-watch/actions/runs/40859124895) — **成功**、API送信0回 |
+| 実API実行 | [Actions #40859340016](https://github.com/YanTKYS/news-watch/actions/runs/40859340016) — **失敗**、API送信試行1回 |
+| 実行日時 | 2026-10-29 19:39頃（JST） |
+| 実行環境 | Linux / GitHub Actions `ubuntu-latest`、`main` |
+| 対象・方式 | `sarashina3.2-mini-thinking`、`POST /v1/chat/completions` |
+| 送信条件 | `execute=true`、Bearer認証、`reasoning_effort=low`、`max_completion_tokens=1024`、`stream=false` |
+| HTTP | **403** |
+| Content-Type | **`text/html`** |
+| Server | **`awselb/2.0`** |
+| 応答時間 | **0.68秒** |
+| 試行数・再試行 | **1回・リトライなし** |
+| 診断結果 | `status=new_chat_failed`、`new_chat_success=false`、`result=http_error` |
+| 旧ヘッダー特徴との一致 | `matches_legacy_header_signature=true` |
 
-本番採用・自動フォールバック、W40、月刊、組織内・住民データの利用は対象外。
+証跡：実行 [#40859340016](https://github.com/YanTKYS/news-watch/actions/runs/40859340016) の [Artifact `sarashina-phase1-40859340016-1`](https://github.com/YanTKYS/news-watch/actions/runs/40859340016/artifacts/12890079040) 内、`metrics.json` と `report.md`。Artifactは保持期限のある一時成果物（この実行は10日間）なので主要指標を本書に転記した。ログにも `Phase 1 status: new_chat_failed; API requests: 1` と記録された。
+
+**旧モデル（`sarashina3-mini`）と `GET /v1/models` の新規試行は0回。** 新モデルが失敗した時点で後続の送信を停止する設計どおり。W42の15記事も送信していない。APIキー、HTTPエラー本文、チャット応答はArtifactやこの文書に保存していない。
+
+## 旧検証との比較と解釈
+
+| 比較 | 旧検証（2026-10-17頃） | 今回（2026-10-29） |
+| --- | --- | --- |
+| モデル | `sarashina3-mini` | `sarashina3.2-mini-thinking` |
+| GitHubホストランナー | `ubuntu-latest` | `ubuntu-latest` |
+| 最小チャット | HTTP 403 | HTTP 403 |
+| Content-Type | `text/html` | `text/html` |
+| Server | `awselb/2.0` | `awselb/2.0` |
+| エラー本文 | HTML、118バイト | **未取得・未保存** |
+
+- **確認できたこと**：新モデルのChat Completionsでも旧403と同じHTTPステータス・レスポンスヘッダー分類を観測した。今回の更新でGitHub Actionsから利用できるようになった、という結果にはならなかった。
+- **確認できないこと**：403の発生箇所（ロードバランサ/WAF/認証/API権限など）、送信元IPやネットワーク制限の有無、キーの発行元・有効範囲、旧HTML本文との一致。ヘッダー `awselb/2.0` は原因や拒否主体の確定根拠ではない。今回のHTTP 403が、新モデルの生成品質を示すものでもない。
+- **API互換性の評価**：認証以前または認証処理中の拒否も考えられるため、パラメータ受理や `reasoning_effort` の動作までは検証できなかった。送信元の違うWindows実機で成功した報告はあるが、今回のActions成功を示す証拠には使わない。
+
+## Phase 2（W42生成・品質比較）の扱い
+
+Issue #24では、**GitHub Actionsから新モデルのHTTP 200かつ非空・正常完了のチャット応答を確認できた場合に限り**、W42の15記事でGemini・PLaMoと比較することとしていた。
+
+今回はその条件を満たさなかったため、次の作業を**実施せず終了**する。
+
+- 2026-W42の15記事のAPI送信、構造化出力・出典ID検証、候補Markdown生成
+- GeminiとPLaMoとの日本語・トピック選定・実務上の示唆・速度・費用の比較
+- Sarashinaの本番採用、Geminiからの切替、自動フォールバック
+
+既存のGemini本番運用、PLaMo実験、日刊ログ・週刊/月刊レビュー、公開サイトは変更していない。
+
+## 今後に再検証する場合
+
+1. Sarashina提供元に **GitHub Actions `ubuntu-latest` からの `POST /v1/chat/completions` でHTTP 403 / `text/html` / `awselb/2.0` が返る**事実を伝え、送信元制限・WAF・キー権限・無償ベータの利用条件を確認する。キーやエラー本文を公開Issueに貼らない。
+2. 必要があれば、同一キー・同一リクエストをWindows実機や別の信頼済み環境で比較する。ただし本Issueでの追加API実行は行わず、別途範囲・上限を決める。
+3. GitHubホストランナーから新モデルの接続成功が得られた場合のみ、W42の品質比較を新しいIssueとして検討する。
+
+**完了判断：GitHub Actionsからの再疎通試験は実施済み・旧403と同じ特徴を再確認。理由は未確定。Phase 2は条件未達として見送り、Issue #24の検証を終了する。**
