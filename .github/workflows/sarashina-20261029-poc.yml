@@ -1,0 +1,57 @@
+name: Sarashina 20261029 connectivity PoC
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: Send up to 3 requests (false = offline only)
+        type: boolean
+        required: true
+        default: false
+      include_models:
+        description: Also check GET /v1/models after a successful new-model chat
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sarashina-20261029-poc
+  cancel-in-progress: false
+
+jobs:
+  connectivity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Offline preparation
+        if: ${{ !inputs.execute }}
+        run: python experiments/sarashina-20261029/probe.py --runner ubuntu-latest --run-name "actions-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Probe with a hard request limit
+        if: ${{ inputs.execute }}
+        env:
+          SARASHINA_API_KEY: ${{ secrets.SARASHINA_API_KEY }}
+          INCLUDE_MODELS: ${{ inputs.include_models }}
+        run: |
+          args=()
+          if [ "$INCLUDE_MODELS" != "true" ]; then args+=(--skip-models); fi
+          python experiments/sarashina-20261029/probe.py --execute --runner ubuntu-latest --run-name "actions-${{ github.run_id }}-${{ github.run_attempt }}" "${args[@]}"
+      - name: Collect diagnostics on success or failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarashina-phase1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            experiments/sarashina-20261029/runs/actions-${{ github.run_id }}-${{ github.run_attempt }}/README.md
+            experiments/sarashina-20261029/runs/actions-${{ github.run_id }}-${{ github.run_attempt }}/metrics.json
+            experiments/sarashina-20261029/runs/actions-${{ github.run_id }}-${{ github.run_attempt }}/report.md
+          if-no-files-found: warn
+          retention-days: 14
