@@ -119,6 +119,9 @@ class TargetMonth(unittest.TestCase):
         self.check("2026-11-30", "2026-10-01", "2026-10-31")
         self.check("2027-01-01", "2026-12-01", "2026-12-31")  # 年またぎ
         self.check("2026-02-01", "2026-01-01", "2026-01-31")
+        for day in (1, 2, 3):
+            self.check(f"2026-11-{day:02d}", "2026-10-01", "2026-10-31")
+            self.check(f"2027-01-{day:02d}", "2026-12-01", "2026-12-31")
 
     def test_month_lengths(self):
         self.check("2026-03-01", "2026-02-01", "2026-02-28")  # 28日
@@ -285,6 +288,62 @@ class RunFlow(Base):
         self.assertEqual((code, m.call_count), (0, 1), err)
         self.assertIn("## 今月の総括", self.output().read_text(encoding="utf-8"))
 
+    def test_scheduled_catchup_days_skip_after_first_success(self):
+        self.october()
+        summary = Path(self.tmp.name) / "summary.md"
+        env = {"GEMINI_API_KEY": SECRET, "GITHUB_EVENT_NAME": "schedule", "GITHUB_STEP_SUMMARY": str(summary)}
+        code, m, _, err = self.run_monthly(self.ok(), today="2026-11-01", env=env)
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        saved = self.output().read_bytes()
+        modified = self.output().stat().st_mtime_ns
+        index = self.index.read_bytes()
+        for day in (2, 3):
+            with self.subTest(day=day), mock.patch.object(weekly, "load_week_articles",
+                                                         side_effect=AssertionError("skip before loading inputs")):
+                # No key is needed once the previous month's review exists.
+                code, m, out, err = self.run_monthly(today=f"2026-11-{day:02d}", env={
+                    "GITHUB_EVENT_NAME": "schedule", "GITHUB_STEP_SUMMARY": str(summary)})
+                self.assertEqual((code, m.call_count), (0, 0), err)
+                self.assertIn("Monthly target: 2026-10", out)
+                self.assertIn("API requests: 0", out)
+                self.assertEqual(self.output().read_bytes(), saved)
+                self.assertEqual(self.output().stat().st_mtime_ns, modified)
+                self.assertEqual(self.index.read_bytes(), index)
+                text = summary.read_text()
+                for expected in ("| 対象 | 2026-10 |", "| 実行種別 | 定期 |", "| APIリクエスト回数 | 0回"):
+                    self.assertIn(expected, text)
+
+    def test_second_day_can_generate_after_missing_first_day(self):
+        # No first-day invocation; day 2 must still target October, not September.
+        self.october()
+        env = {"GEMINI_API_KEY": SECRET, "GITHUB_EVENT_NAME": "schedule"}
+        code, m, out, err = self.run_monthly(self.ok(), today="2026-11-02", env=env)
+        self.assertEqual((code, m.call_count), (0, 1), err)
+        self.assertIn("Monthly target: 2026-10", out)
+        saved = self.output().read_bytes()
+        code, m, _, err = self.run_monthly(today="2026-11-03", env=env)
+        self.assertEqual((code, m.call_count), (0, 0), err)
+        self.assertEqual(self.output().read_bytes(), saved)
+
+    def test_three_scheduled_failures_remain_bounded_and_preserve_inputs(self):
+        self.october()
+        original = {p: p.read_bytes() for p in self.logs.rglob("*.md")}
+        env = {"GEMINI_API_KEY": SECRET, "GITHUB_EVENT_NAME": "schedule"}
+
+        def unavailable(*args, **kwargs):
+            raise http_error(503, {})
+
+        for day in (1, 2, 3):
+            with self.subTest(day=day):
+                code, m, out, _ = self.run_monthly(unavailable, today=f"2026-11-{day:02d}", env=env)
+                self.assertEqual((code, m.call_count), (1, 2))
+                self.assertIn("Monthly target: 2026-10", out)
+                self.assertFalse(self.output().exists())
+                self.assertFalse(self.index.exists())
+        self.assertEqual(len(self.requests), 6)
+        self.assertEqual(self.sleep.call_count, 3)
+        self.assertEqual({p: p.read_bytes() for p in self.logs.rglob("*.md")}, original)
+
     def test_unfinished_month_is_rejected(self):
         self.october()
         code, m, _, err = self.run_monthly(month="2026-10", today="2026-10-31")
@@ -436,7 +495,7 @@ class RepoLayout(unittest.TestCase):
         wf = yaml.safe_load(text)
         triggers = wf.get(True, wf.get("on"))
         self.assertEqual(set(triggers), {"schedule", "workflow_dispatch"})
-        self.assertEqual(triggers["schedule"], [{"cron": "3 0 1 * *"}])  # 毎月1日 JST 9:03
+        self.assertEqual(triggers["schedule"], [{"cron": "23 0 1-3 * *"}])  # 毎月1〜3日 JST 9:23
         self.assertEqual(set(triggers["workflow_dispatch"]["inputs"]), {"month", "regenerate"})
         self.assertEqual(wf["permissions"], {"contents": "write"})
         weekly_wf = yaml.safe_load((ROOT / ".github/workflows/weekly.yml").read_text(encoding="utf-8"))
@@ -448,6 +507,34 @@ class RepoLayout(unittest.TestCase):
             self.assertIn(needle, text)
         for forbidden in ("BRAVE_API_KEY", "JEV_API_KEY", "${{ inputs.month }}\""):
             self.assertNotIn(forbidden, text)
+
+    def test_monthly_workflow_arguments_preserve_schedule_and_manual_behavior(self):
+        import yaml
+        wf = yaml.safe_load((ROOT / ".github/workflows/monthly.yml").read_text())
+        triggers = wf.get(True, wf.get("on"))
+        inputs = triggers["workflow_dispatch"]["inputs"]
+        self.assertEqual(inputs["month"]["default"], "")
+        self.assertFalse(inputs["regenerate"]["default"])
+        steps = wf["jobs"]["monthly"]["steps"]
+        checkout = next(s for s in steps if s.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["ref"], "${{ github.ref_name }}")
+        generate = next(s for s in steps if s.get("name") == "Generate monthly review")
+        self.assertEqual(generate["env"]["MONTH"], "${{ inputs.month }}")
+        self.assertEqual(generate["env"]["REGENERATE"], "${{ inputs.regenerate }}")
+        # Exercise the actual workflow shell without invoking Python or any API.
+        stub = 'python() { printf "%s\\n" "$@"; }\n'
+        for month, regenerate, expected in (
+            ("", "", []),  # schedule has no dispatch inputs
+            ("", "false", []),
+            ("2026-10", "false", ["--month", "2026-10"]),
+            ("2026-10", "true", ["--month", "2026-10", "--force"]),
+            ("", "true", ["--force"]),
+        ):
+            with self.subTest(month=month, regenerate=regenerate):
+                res = subprocess.run(["bash", "-c", stub + generate["run"]],
+                                     env={"MONTH": month, "REGENERATE": regenerate},
+                                     capture_output=True, text=True, check=True)
+                self.assertEqual(res.stdout.splitlines(), ["scripts/monthly.py", *expected])
 
     def test_daily_collection_is_independent(self):
         for name in (".github/workflows/collect.yml", "scripts/collect.py"):

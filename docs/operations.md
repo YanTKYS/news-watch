@@ -24,7 +24,7 @@ GitHub Actionsで運用する場合は、リポジトリの **Settings → Secre
 | --- | --- | --- | --- |
 | `Collect news` | 毎日7:17頃 | なし | [collect.yml](../.github/workflows/collect.yml) |
 | `Weekly review` | 毎週月曜8:29頃 | `week`、`regenerate` | [weekly.yml](../.github/workflows/weekly.yml) |
-| `Monthly review` | 毎月1日9:03頃 | `month`、`regenerate` | [monthly.yml](../.github/workflows/monthly.yml) |
+| `Monthly review` | 毎月1〜3日9:23頃 | `month`、`regenerate` | [monthly.yml](../.github/workflows/monthly.yml) |
 
 手動実行は **Actions → 対象ワークフロー → Run workflow**。公開データを更新する通常運用では `main` を選ぶ。ワークフローは変更した出力をcommit・pushする。日刊は新着がなくても、拒否キャッシュや検索インデックスに差分があればcommitすることがある。
 
@@ -40,6 +40,14 @@ GitHub Actionsで運用する場合は、リポジトリの **Settings → Secre
 ### 月刊の対象指定
 
 `month`（例: `2026-09`）を指定するとその月、空欄なら前月を対象とする。終了した月のみ指定できる。生成済みは通常スキップし、上書きする場合だけ `regenerate=true` を指定する。記事がない月はAPIを呼ばない。週刊のような複数月の自動欠号補完はない。
+
+定期起動はUTCの `23 0 1-3 * *`（毎月1・2・3日JST 09:23）。どの日も対象は実行時点の前月で、1日の起動が欠落・失敗した場合に2・3日にも生成の機会を設ける。通常は最初の成功で前月号を保存し、翌日以降は**API呼び出し0回・レビュー変更なし**でスキップする。スキップ判定は、共通concurrencyによる待機後に取得した最新のブランチ状態で行う。定期処理は強制再生成せず、`regenerate=true` は手動入力に限る。
+
+各実行のGemini APIは既存の最大2回を維持するが、3日とも未生成のままAPI障害が続けば、**定期起動3回で最大6回の送信試行**になり得る（手動実行・ジョブの再実行は別枠）。タイムアウト後のサーバー側処理・課金も考慮し、追加の無条件再実行は避ける。4日以降に自動で繰り返したり、過去の欠号へ遡ったりはしない。
+
+GitHubの[`schedule`の仕様](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)では、高負荷時の遅延・欠落があり得る。複数日に機会を増やしても起動は完全保証できない。3日を過ぎても未生成なら、Actionsでワークフローの有効状態、デフォルトブランチ上の定義、リポジトリの活動状況、scheduled actorの条件と実行履歴を確認し、必要に応じて `month` を指定して手動実行する。公開リポジトリは60日間活動がないと定期実行が自動無効化され得る。actorの条件はアカウントやEnterprise設定にも依存し、手動実行の成功だけでは定期実行の条件を証明できない。
+
+週刊が不足していても月刊は日刊から生成できる。ログの `Weekly reviews: 使用可能号数 of 対象号数 (missing: ...; daily logs are used instead)` で不足号を、`Weekly topics used` と生成物末尾の「参照した週刊レビュー」で実際に入力へ利用した件数を確認する。使用可能号数と利用件数は異なり、週刊の欠号だけで月刊の失敗とは判断しない。欠号補完・内容の改善はこの定期起動対策とは分けて扱う。
 
 ## 実行結果と障害時の判断
 
