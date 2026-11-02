@@ -1,6 +1,8 @@
 # W43 API比較PoC
 
-[Issue #29](https://github.com/YanTKYS/news-watch/issues/29) のGemini `gemini-3.6-flash` / PLaMo `plamo-3.1-prime` 比較用。**実APIは未実施。** 本番のモデル変数・週刊/月刊コード・定期workflow・レビュー・インデックスは変更しない。結果・採用判断は [evaluation.md](evaluation.md) に記録する。
+[Issue #29](https://github.com/YanTKYS/news-watch/issues/29) のGemini `gemini-3.6-flash` / PLaMo `plamo-3.1-prime` 比較用。**2026-11-02の実API比較は両モデルとも成功し、PoCは完了。** その後の運用判断で週刊はPLaMoへ切替済み、月刊はGeminiを維持している。証跡・採用理由・本番反映結果は [evaluation.md](evaluation.md) を参照。
+
+以下は実装・検証時の手順を残したもの。追加比較の実行やPoC拡張を指示するものではなく、本PoC自体は本番のモデル変数・コード・レビュー・インデックスを更新しない。本番切替は別途PR #34で行った。
 
 ## 固定入力と再利用
 
@@ -63,7 +65,7 @@ API試験に進んだ場合、Geminiが503・タイムアウト・構造不正�
 
 ## 回収と評価
 
-Artifact名は `w43-comparison-RUN_ID-RUN_ATTEMPT`。成否を問わず、両モデルの次のファイルと `comparison/` の診断だけを1つに回収する（保持14日）。保持期限に頼らず、実行URLと主要指標・人手評価は後続PRで `evaluation.md` に残す。
+Artifact名は `w43-comparison-RUN_ID-RUN_ATTEMPT`。成否を問わず、両モデルの次のファイルと `comparison/` の診断だけを1つに回収する。保持期間は10日（リポジトリ上限による）。保持期限に頼らず、実行URLと主要指標・人手評価は後続PRで `evaluation.md` に残す。
 
 - `input-manifest.json`: 入力順・ID/URL対応、ハッシュ、スキーマ調整記録。
 - `metrics.json`: 固定モデル、HTTP、送信試行回数、秒数、usage、完了理由、検証成否、失敗stage。未知の完了理由は `other` にし、任意文字列を転記しない。
