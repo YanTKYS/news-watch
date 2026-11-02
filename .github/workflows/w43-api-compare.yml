@@ -1,0 +1,74 @@
+name: W43 API comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Select exactly one model; run each comparison independently
+        type: choice
+        options:
+          - gemini-3.6-flash
+          - plamo-3.1-prime
+        default: gemini-3.6-flash
+        required: true
+      execute:
+        description: Send one request (false = offline preparation only)
+        type: boolean
+        default: false
+        required: true
+      spec_confirmed:
+        description: Official model/schema/limits, key access and terms reviewed
+        type: boolean
+        default: false
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: w43-api-compare-${{ inputs.model }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SELECTED_MODEL: ${{ inputs.model }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require specification confirmation
+        if: ${{ inputs.execute && !inputs.spec_confirmed }}
+        run: |
+          echo 'Review the official specification, key access and terms before executing; API requests: 0.'
+          exit 1
+      - name: Offline preparation
+        if: ${{ !inputs.execute }}
+        run: python scripts/w43_api_compare.py --model "$SELECTED_MODEL" --run-name "actions-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Execute selected Gemini model once
+        if: ${{ inputs.execute && inputs.spec_confirmed && inputs.model == 'gemini-3.6-flash' }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python scripts/w43_api_compare.py --model "$SELECTED_MODEL" --execute --spec-confirmed --run-name "actions-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Execute selected PLaMo model once
+        if: ${{ inputs.execute && inputs.spec_confirmed && inputs.model == 'plamo-3.1-prime' }}
+        env:
+          PLAMO_API_KEY: ${{ secrets.PLAMO_API_KEY }}
+        run: python scripts/w43_api_compare.py --model "$SELECTED_MODEL" --execute --spec-confirmed --run-name "actions-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Collect safe comparison results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: w43-${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            experiments/w43-api-compare/runs/${{ inputs.model }}/actions-${{ github.run_id }}-${{ github.run_attempt }}/input-manifest.json
+            experiments/w43-api-compare/runs/${{ inputs.model }}/actions-${{ github.run_id }}-${{ github.run_attempt }}/metrics.json
+            experiments/w43-api-compare/runs/${{ inputs.model }}/actions-${{ github.run_id }}-${{ github.run_attempt }}/report.md
+            experiments/w43-api-compare/runs/${{ inputs.model }}/actions-${{ github.run_id }}-${{ github.run_attempt }}/candidate.md
+          if-no-files-found: warn
+          retention-days: 14
