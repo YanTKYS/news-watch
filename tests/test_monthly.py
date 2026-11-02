@@ -71,6 +71,7 @@ class Base(unittest.TestCase):
 
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(weekly.urllib.request, "urlopen", side_effect=recorder) as m, \
+                mock.patch.object(weekly.plamo_api, "open_once", side_effect=AssertionError("monthly must not call PLaMo")), \
                 redirect_stdout(out), redirect_stderr(err):
             code = monthly.run(month_arg=month, force=force, logs_dir=self.logs, weekly_dir=self.weekly_dir,
                                monthly_dir=self.monthly_dir, index_path=self.index, today=today, env=env)

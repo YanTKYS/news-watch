@@ -2,9 +2,9 @@ name: Weekly review
 
 # 直近の日刊ログ（logs/）から週刊レビューを生成する。Brave/Jev APIは使わない。
 # 1回の実行で生成するのは最大1週。週を指定しない場合は、直近4週のうち未生成で最も古い週（記事のある週）を選ぶ（欠号補完）。
-# Gemini APIは通常1リクエスト。一時的なエラー（429/5xx・タイムアウト）に限り1回だけ再試行する（最大2リクエスト、別モデルへの切り替えなし）。
+# PLaMo APIは通常1リクエスト。一時的なエラー（429/5xx・タイムアウト）に限り1回だけ再試行する（最大2リクエスト、別モデルへの切り替えなし）。
 # 生成済みの週は regenerate 指定時のみ再生成する。実行結果（対象週・区分・APIリクエスト回数など）は実行サマリーに出力する。
-# モデルは Repository variable GEMINI_MODEL で変更できる（未設定なら scripts/weekly.py の既定値）。
+# モデルは plamo-3.1-prime 固定。月刊用のGEMINI_MODELは参照しない。
 # トリガーは schedule と workflow_dispatch のみ（Secretを使うため pull_request 等では実行しない）。
 on:
   schedule:
@@ -48,8 +48,7 @@ jobs:
 
       - name: Generate weekly review
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          PLAMO_API_KEY: ${{ secrets.PLAMO_API_KEY }}
           WEEK: ${{ inputs.week }}
           REGENERATE: ${{ inputs.regenerate }}
         run: |

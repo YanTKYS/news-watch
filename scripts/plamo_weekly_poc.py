@@ -16,20 +16,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import weekly
+import plamo_api
 
 WEEK = "2026-W42"
-MODEL = "plamo-3.1-prime"
-ENDPOINT = "https://api.platform.preferredai.jp/v1/chat/completions"
+MODEL = plamo_api.MODEL
+ENDPOINT = plamo_api.ENDPOINT
 OUTPUT_ROOT = weekly.ROOT / "experiments" / "plamo-w42" / "runs"
 TIMEOUT_SEC = 180
 EXPECTED_ARTICLES = 15
 EXPECTED_INPUT_SHA256 = "cc6cf4395784aa96ee4be0b3882f5ce0eb66a72aeac066024dcfdc1f7855299f"
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # A redirect would be a second request and could forward authorization.
-        return None
+NoRedirect = plamo_api.NoRedirect
 
 
 def prepare(logs_dir: Path) -> tuple[weekly.Week, list[weekly.Article], dict]:
@@ -60,71 +58,28 @@ def digest(value) -> str:
 
 
 def build_request(week: weekly.Week, articles: list[weekly.Article], key: str) -> urllib.request.Request:
-    body = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": weekly.SYSTEM_PROMPT},
-            {"role": "user", "content": weekly.build_user_prompt(week, articles)},
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "weekly_review", "strict": True,
-                            "schema": weekly.response_schema([a.id for a in articles])},
-        },
-        "max_tokens": weekly.MAX_OUTPUT_TOKENS,
-        "stream": False,
-    }
-    return urllib.request.Request(
-        ENDPOINT, data=json.dumps(body, ensure_ascii=False).encode(), method="POST",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                 "Accept": "application/json", "User-Agent": weekly.USER_AGENT},
-    )
+    return plamo_api.build_request(weekly.SYSTEM_PROMPT, weekly.build_user_prompt(week, articles),
+                                   weekly.response_schema([a.id for a in articles]), key,
+                                   max_tokens=weekly.MAX_OUTPUT_TOKENS, user_agent=weekly.USER_AGENT)
 
 
 def open_once(request):
-    # Uses the session proxy and default TLS verification. No retry or tools.
-    return urllib.request.build_opener(NoRedirect()).open(request, timeout=TIMEOUT_SEC)
+    return plamo_api.open_once(request, timeout=TIMEOUT_SEC)
 
 
 def extract_text(data: dict) -> str:
-    choices = data.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-        raise weekly.ValidationError("expected one choice")
-    choice = choices[0]
-    message = choice.get("message")
-    if choice.get("finish_reason") != "stop" or not isinstance(message, dict):
-        raise weekly.ValidationError("incomplete output")
-    if message.get("refusal") or message.get("tool_calls") or message.get("function_call"):
-        raise weekly.ValidationError("refusal or tool call")
-    text = message.get("content")
-    if not isinstance(text, str) or not text.strip():
-        raise weekly.ValidationError("missing text")
-    return text
+    try:
+        return plamo_api.extract_text(data)
+    except plamo_api.PlamoError as error:
+        raise weekly.ValidationError(str(error)) from error
 
 
 def validate_output(text: str, ids: set[str]) -> weekly.Review:
-    # weekly.validate_review checks values, lengths, URLs and source IDs.
-    # Check exact fields locally too: the production validator tolerates extras.
-    try:
-        data = json.loads(text)
-    except ValueError as e:
-        raise weekly.ValidationError("invalid JSON") from e
-    if not isinstance(data, dict) or set(data) != {"overview", "topics", "closing"}:
-        raise weekly.ValidationError("unexpected root fields")
-    if not isinstance(data["topics"], list):
-        raise weekly.ValidationError("invalid topics")
-    fields = {"title", "summary", "implication", "source_ids"}
-    if any(not isinstance(t, dict) or set(t) != fields for t in data["topics"]):
-        raise weekly.ValidationError("unexpected topic fields")
     return weekly.validate_review(text, ids)
 
 
 def usage_tokens(data: dict) -> dict:
-    usage = data.get("usage")
-    if not isinstance(usage, dict):
-        return {}
-    return {k: v for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-            if type(v := usage.get(k)) is int and v >= 0}
+    return plamo_api.usage_tokens(data)
 
 
 def write_json(path: Path, value) -> None:

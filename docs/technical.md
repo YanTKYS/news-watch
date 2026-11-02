@@ -61,7 +61,7 @@ Jev未設定時は非関連キャッシュも使わない。期限切れキャ�
 
 ## 週刊・月刊レビュー
 
-実装は [weekly.py](../scripts/weekly.py) と [monthly.py](../scripts/monthly.py)。本番はGeminiの `generateContent` を使い、月刊も週刊のAPI呼び出し・モデル設定を共用する。Brave/Jevの再検索、Google検索等のツール利用、元記事本文の取得は行わない。定期・手動の対象選択や欠号補完は[運用手順](operations.md#週刊の対象指定と欠号補完)を参照。
+実装は [weekly.py](../scripts/weekly.py) と [monthly.py](../scripts/monthly.py)。週刊はPLaMo `plamo-3.1-prime` のChat Completionsを使い、通信・応答形式は [plamo_api.py](../scripts/plamo_api.py) をPoCと共用する。週の選択・保存・限定再試行は本番の週刊処理が担い、W42/W43固定のPoC処理は呼ばない。月刊は従来どおりGemini `generateContent` と `GEMINI_MODEL` を使い、そのためのモデル解決・Gemini通信関数はweekly.pyに維持する。Brave/Jevの再検索、Google検索等のツール利用、元記事本文の取得は行わない。定期・手動の対象選択や欠号補完は[運用手順](operations.md#週刊の対象指定と欠号補完)を参照。
 
 ### 入力の選別
 
@@ -80,9 +80,9 @@ Jev未設定時は非関連キャッシュも使わない。期限切れキャ�
 ### 構造と検証
 
 - 週刊は「今週の概況／注目トピック（1〜5件）／今週のまとめ」。月刊は「今月の総括／主要トレンド（1〜6件）／翌月以降の注目点」。各トピックには見出し、説明、自治体実務への示唆、出典を含める。
-- `responseJsonSchema` によるJSONの構造化出力をPythonで再検証する。必須項目・型・文字数・件数、本文にURLを含まないこと、出典IDが入力に属し重複しないことなどを検証する。詳細な文字数・Schemaの定義は各スクリプトを正本とする。
-- 候補なし、安全性ブロック、`finishReason` が `STOP` 以外、不正JSON、内容検証失敗は保存せず実行失敗にする。自動修復・別モデルへの切り替えはしない。
-- 思考上限は2048トークン、出力上限は16384トークン。思考トークンも出力上限に含まれるため分けて指定する。APIの回数・タイムアウト・再試行条件は[運用手順](operations.md#apiの再試行方針)を参照。
+- 週刊は `response_format.json_schema`（`strict=true`）、月刊は `responseJsonSchema` によるJSONの構造化出力をPythonで再検証する。必須項目・型・文字数・件数、本文にURLを含まないこと、出典IDが入力に属し重複しないことなどを検証し、週刊の余分なプロパティも拒否する。詳細な文字数・Schemaの定義は各スクリプトを正本とする。
+- 週刊は応答モデル名の一致、choicesが1件、`finish_reason=stop`、非空の本文を必須とし、拒否・ツール呼び出し・不正JSON・内容検証失敗を保存しない。月刊は従来どおり候補なし・安全性ブロック・`finishReason` が `STOP` 以外等を拒否する。自動修復・別モデルへの切り替えはしない。
+- 出力上限はどちらも16384トークン（PLaMoは `max_tokens`、Geminiは `maxOutputTokens`）。Gemini月刊だけは思考上限2048トークンも指定し、思考トークンが出力上限に含まれることを考慮する。APIの回数・タイムアウト・再試行条件は[運用手順](operations.md#apiの再試行方針)を参照。
 - 出典リンクはAIが書いたURLを使わず、検証済みIDからPythonで元記事のhttp/https URLを付与する。出力にはAI生成の注記、モデル、元記事数・入力件数、生成日を残す。
 
 レビュー生成は日刊ログ・`seen.json` を読み取るだけで変更しない。出力Markdownと対応するレビュー一覧JSONを更新する。構造・出典検証は記述内容の事実確認を代替するものではない。

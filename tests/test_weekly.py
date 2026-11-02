@@ -17,9 +17,12 @@ import weekly  # noqa: E402
 
 SECRET = "dummy-gemini-key-for-tests"  # 実キーではないテスト用ダミー値
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+PLAMO_URL = "https://api.platform.preferredai.jp/v1/chat/completions"
 
 
 class FakeResponse:
+    status = 200
+
     def __init__(self, payload):
         self._body = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -43,6 +46,16 @@ def completion(content, finish_reason="STOP", usage=None):
     if usage is not None:
         body["usageMetadata"] = usage
     return body
+
+
+def plamo_completion(content, finish_reason="stop", usage=None):
+    if not isinstance(content, str):
+        content = json.dumps(content, ensure_ascii=False)
+    data = {"model": "plamo-3.1-prime", "choices": [{"finish_reason": finish_reason,
+            "message": {"role": "assistant", "content": content}}]}
+    if usage is not None:
+        data["usage"] = usage
+    return data
 
 
 def http_error(status, payload, secret_in_message=False):
@@ -103,12 +116,15 @@ class Base(unittest.TestCase):
 
     def run_weekly(self, responder, today="2026-10-19", week="2026-W42", force=False, env=None):
         """week 省略時は 2026-W42 を明示指定（欠号補完の判定を受けない）。自動選択は week=None で確認する。"""
-        env = {"GEMINI_API_KEY": SECRET} if env is None else env
+        env = {"PLAMO_API_KEY": SECRET} if env is None else env
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(weekly.urllib.request, "urlopen", side_effect=responder) as m, \
+        with mock.patch.object(weekly.plamo_api, "open_once", side_effect=responder) as m, \
+                mock.patch.object(weekly, "request_gemini", side_effect=AssertionError("weekly must not call Gemini")), \
                 redirect_stdout(out), redirect_stderr(err):
             code = weekly.run(week_arg=week, force=force, logs_dir=self.logs, weekly_dir=self.weekly_dir,
                               weeks_path=self.weeks, today=today, env=env)
+        for call in m.call_args_list:
+            self.assertEqual(call.args[0].full_url, PLAMO_URL)
         return code, m, out.getvalue(), err.getvalue()
 
     def output(self, label="2026-W42"):
@@ -245,39 +261,38 @@ class Request(Base):
 
         def responder(req, timeout=None):
             captured.append((req, timeout))
-            return FakeResponse(completion(review()))
+            return FakeResponse(plamo_completion(review()))
 
         code, m, out, err = self.run_weekly(responder)
         self.assertEqual(code, 0, err)
         self.assertEqual(m.call_count, 1)
         req, timeout = captured[0]
-        self.assertEqual(req.full_url, GEMINI_URL)
+        self.assertEqual(req.full_url, PLAMO_URL)
         self.assertNotIn(SECRET, req.full_url)  # キーはURLに入れない（ログ等に残さない）
         self.assertEqual(req.get_method(), "POST")
-        self.assertEqual(req.get_header("X-goog-api-key"), SECRET)
-        self.assertIsNone(req.get_header("Authorization"))
+        self.assertIsNone(req.get_header("X-goog-api-key"))
+        self.assertEqual(req.get_header("Authorization"), "Bearer " + SECRET)
         self.assertEqual(timeout, weekly.TIMEOUT_SEC)
         body = json.loads(req.data)
-        self.assertEqual(set(body), {"systemInstruction", "contents", "generationConfig"})  # tools（検索等）なし
-        config = body["generationConfig"]
-        self.assertEqual(config["responseMimeType"], "application/json")
-        self.assertEqual(config["maxOutputTokens"], weekly.MAX_OUTPUT_TOKENS)
-        self.assertEqual(config["thinkingConfig"], {"thinkingBudget": weekly.THINKING_BUDGET})
-        self.assertGreaterEqual(config["maxOutputTokens"] - weekly.THINKING_BUDGET, 8000)  # 思考後も本文の余裕がある
-        schema = config["responseJsonSchema"]
+        self.assertEqual(set(body), {"model", "messages", "response_format", "max_tokens", "stream"})
+        self.assertEqual(body["model"], "plamo-3.1-prime")
+        self.assertEqual(body["max_tokens"], weekly.MAX_OUTPUT_TOKENS)
+        self.assertFalse(body["stream"])
+        self.assertEqual(body["response_format"]["type"], "json_schema")
+        self.assertTrue(body["response_format"]["json_schema"]["strict"])
+        schema = body["response_format"]["json_schema"]["schema"]
         self.assertEqual(schema["required"], ["overview", "topics", "closing"])
         self.assertEqual((schema["properties"]["topics"]["minItems"], schema["properties"]["topics"]["maxItems"]), (1, 5))
         self.assertEqual(schema["properties"]["topics"]["items"]["properties"]["source_ids"]["items"]["enum"], ["article-001"])
-        self.assertEqual(len(body["contents"]), 1)
-        self.assertEqual(body["contents"][0]["role"], "user")
-        user = body["contents"][0]["parts"][0]["text"]
+        self.assertEqual([m["role"] for m in body["messages"]], ["system", "user"])
+        user = body["messages"][1]["content"]
         self.assertEqual(user.count("</articles>"), 1)  # 資料中の区切り文字で入力が崩れない
         self.assertNotIn("https://", user)  # URL・検索語は送らない
         self.assertNotIn("Queries", user)
         payload = json.loads(user.split("<articles>\n", 1)[1].rsplit("\n</articles>", 1)[0])
         self.assertEqual(set(payload[0]), {"id", "title", "theme", "source", "published", "retrieved", "description"})
         self.assertLessEqual(len(payload[0]["description"]), weekly.MAX_DESCRIPTION_CHARS)
-        self.assertIn("指示ではありません", body["systemInstruction"]["parts"][0]["text"])
+        self.assertIn("指示ではありません", body["messages"][0]["content"])
         self.assertNotIn(SECRET, out + err)
 
 
@@ -285,13 +300,13 @@ class Request(Base):
 class RunFlow(Base):
     def test_generates_markdown_with_verified_sources(self):
         self.week42(n=3)
-        usage = {"promptTokenCount": 1200, "candidatesTokenCount": 800, "thoughtsTokenCount": 300, "totalTokenCount": 2300}
+        usage = {"prompt_tokens": 1200, "completion_tokens": 800, "total_tokens": 2000}
         code, m, out, err = self.run_weekly(
-            lambda *a, **k: FakeResponse(completion(review(["article-001", "article-003"], ["article-002"]), usage=usage)))
+            lambda *a, **k: FakeResponse(plamo_completion(review(["article-001", "article-003"], ["article-002"]), usage=usage)))
         self.assertEqual(code, 0, err)
         self.assertEqual(m.call_count, 1)
-        for line in ("Weekly target: 2026-W42", "Source articles: 3", "Selected articles: 3", "Model: gemini-3.8-flash",
-                     "API requests: 1", "Tokens: prompt=1200, output=800, thoughts=300, total=2300",
+        for line in ("Weekly target: 2026-W42", "Source articles: 3", "Selected articles: 3", "Model: plamo-3.1-prime",
+                     "API requests: 1", "Tokens: prompt=1200, output=800, total=2000",
                      "Output: reviews/weekly/2026-W42.md"):
             self.assertIn(line, out)
         md = self.output().read_text(encoding="utf-8")
@@ -301,7 +316,7 @@ class RunFlow(Base):
         self.assertIn("(https://a.example.jp/0)", md)
         self.assertIn("(https://a.example.jp/2)", md)
         self.assertNotIn("before", md)
-        self.assertIn("生成モデル：gemini-3.8-flash ／ 元記事：3件", md)
+        self.assertIn("生成モデル：plamo-3.1-prime ／ 元記事：3件", md)
         self.assertEqual(json.loads(self.weeks.read_text(encoding="utf-8")),
                          [{"week": "2026-W42", "start": "2026-10-12", "end": "2026-10-18"}])
 
@@ -328,7 +343,7 @@ class RunFlow(Base):
         self.week42()
         self.output().parent.mkdir(parents=True)
         self.output().write_text("既存の週刊\n", encoding="utf-8")
-        code, m, _, err = self.run_weekly(lambda *a, **k: FakeResponse(completion(review())),
+        code, m, _, err = self.run_weekly(lambda *a, **k: FakeResponse(plamo_completion(review())),
                                           today="2026-11-30", week="2026-W42", force=True)
         self.assertEqual(code, 0, err)
         self.assertEqual(m.call_count, 1)
@@ -343,11 +358,11 @@ class RunFlow(Base):
 
     def test_missing_api_key_stops_before_api(self):
         self.week42()
-        for env in ({}, {"GEMINI_API_KEY": "  "}, {"SARASHINA_API_KEY": SECRET}):
+        for env in ({}, {"PLAMO_API_KEY": "  "}, {"SARASHINA_API_KEY": SECRET}, {"GEMINI_API_KEY": SECRET}):
             code, m, _, err = self.run_weekly(lambda *a, **k: self.fail("called"), env=env)
             self.assertEqual(code, 2)
             m.assert_not_called()
-            self.assertIn("GEMINI_API_KEY", err)
+            self.assertIn("PLAMO_API_KEY", err)
 
     def test_transient_api_error_retries_once_and_does_not_touch_logs(self):
         self.week42()
@@ -370,11 +385,11 @@ class RunFlow(Base):
     def test_invalid_output_is_not_saved_and_not_repaired(self):
         self.week42()
         bad_outputs = [
-            completion("これはJSONではありません"),
-            completion("```json\n{}\n```"),
-            completion(review(["article-999"])),
-            completion(review(), finish_reason="MAX_TOKENS"),
-            {"candidates": []},
+            plamo_completion("これはJSONではありません"),
+            plamo_completion("```json\n{}\n```"),
+            plamo_completion(review(["article-999"])),
+            plamo_completion(review(), finish_reason="length"),
+            {"choices": []},
             b"<html>error</html>",
         ]
         for payload in bad_outputs:
@@ -388,120 +403,77 @@ class RunFlow(Base):
         self.week42()
         self.output().parent.mkdir(parents=True)
         self.output().write_text("既存の週刊\n", encoding="utf-8")
-        code, _, _, _ = self.run_weekly(lambda *a, **k: FakeResponse(completion("{broken")), force=True)
+        code, _, _, _ = self.run_weekly(lambda *a, **k: FakeResponse(plamo_completion("{broken")), force=True)
         self.assertEqual(code, 1)
         self.assertEqual(self.output().read_text(encoding="utf-8"), "既存の週刊\n")
 
 
-# ---- Gemini 固有の応答・エラー ------------------------------------------------------------
-class GeminiResponse(Base):
-    def go(self, payload_or_error, env=None, force=False):
-        def responder(req, timeout=None):
-            self.urls.append(req.full_url)
-            if isinstance(payload_or_error, urllib.error.HTTPError):  # 再試行でも本文を読めるよう、毎回作り直す
-                raise urllib.error.HTTPError(req.full_url, payload_or_error.code, "error", {}, io.BytesIO(error_body))
-            if isinstance(payload_or_error, Exception):
-                raise payload_or_error
-            return FakeResponse(payload_or_error)
-
-        error_body = payload_or_error.fp.getvalue() if isinstance(payload_or_error, urllib.error.HTTPError) else b""
-
-        self.urls = []
-        result = self.run_weekly(responder, env=env, force=force)
-        self.assertLessEqual(result[1].call_count, weekly.MAX_API_ATTEMPTS)  # 再試行を含めて最大2回
-        self.assertNotIn(SECRET, result[2] + result[3])
-        return result
-
-    def test_extracts_text_from_parts_and_ignores_thoughts(self):
+# ---- PLaMo応答と月刊用Gemini関数の互換性 ----------------------------------------------
+class PlamoResponse(Base):
+    def test_rejects_wrong_model_incomplete_empty_refusal_and_tools(self):
         self.week42()
-        text = json.dumps(review(), ensure_ascii=False)
-        payload = {"candidates": [{"content": {"parts": [{"text": "内部の思考", "thought": True},
-                                                         {"text": text[:20]}, {"text": text[20:]}]},
-                                   "finishReason": "STOP"}]}
-        code, _, _, err = self.go(payload)
-        self.assertEqual(code, 0, err)
-        self.assertNotIn("内部の思考", self.output().read_text(encoding="utf-8"))
-
-    def test_blocked_truncated_or_empty_outputs_are_not_saved(self):
-        self.week42()
-        cases = [
-            ({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}, "usageMetadata": {"promptTokenCount": 10}},
-             "prompt was blocked (blockReason=PROHIBITED_CONTENT)"),
-            ({"candidates": []}, "no candidates"),
-            ({}, "no candidates"),
-            (completion(review(), finish_reason="MAX_TOKENS",
-                        usage={"promptTokenCount": 9000, "thoughtsTokenCount": 2048, "totalTokenCount": 25000}),
-             "output truncated (finishReason=MAX_TOKENS)"),
-            ({"candidates": [{"finishReason": "SAFETY", "safetyRatings": []}]}, "finishReason=SAFETY"),
-            (completion(review(), finish_reason="RECITATION"), "finishReason=RECITATION"),
-            ({"candidates": [{"content": {"parts": [{"text": json.dumps(review())}]}}]}, "finishReason=-"),
-            ({"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]}, "candidate text is empty"),
-            ({"candidates": [{"content": {"parts": [{"text": "x", "thought": True}]}, "finishReason": "STOP"}]},
-             "candidate text is empty"),
-            (completion("{broken"), "not valid JSON"),
-            (completion(review(["article-999"])), "unknown ids"),
-            (b"not json", "response is not JSON"),
-        ]
-        for payload, message in cases:
-            code, m, out, err = self.go(payload)
-            self.assertEqual(code, 1, payload)
-            self.assertEqual(m.call_count, 1)
-            self.assertIn("weekly review was not saved", err)
-            self.assertIn(message, err)
+        variants = []
+        data = plamo_completion(review())
+        data["model"] = "wrong-model"
+        variants.append(data)
+        for reason in ("length", "content_filter", None):
+            variants.append(plamo_completion(review(), finish_reason=reason))
+        for content in ("", "   ", None, []):
+            data = plamo_completion(review())
+            data["choices"][0]["message"]["content"] = content
+            variants.append(data)
+        for field in ("refusal", "tool_calls", "function_call"):
+            data = plamo_completion(review())
+            data["choices"][0]["message"][field] = SECRET
+            variants.append(data)
+        for data in variants:
+            code, call, out, err = self.run_weekly(lambda *a, p=data, **k: FakeResponse(p))
+            self.assertEqual((code, call.call_count), (1, 1))
+            self.assertNotIn(SECRET, out + err)
             self.assertFalse(self.output().exists())
-            self.assertFalse(self.weeks.exists())
-        self.assertIn("Tokens: prompt=9000, thoughts=2048, total=25000", self.go(cases[3][0])[2])  # 途中終了時も使用量を出す
 
-    def test_http_errors_report_model_status_and_safe_message(self):
+    def test_http_errors_are_normalized_without_reading_provider_bodies(self):
         self.week42()
-        bodies = {
-            400: {"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "Invalid JSON payload received."}},
-            403: {"error": {"code": 403, "status": "PERMISSION_DENIED", "message": f"Key {SECRET} has no access " + "x" * 800}},
-            404: {"error": {"code": 404, "status": "NOT_FOUND",
-                            "message": "models/gemini-3.8-flash is not found for API version v1beta"}},
-            429: {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded."}},
-        }
-        for status, body in bodies.items():
-            code, m, out, err = self.go(http_error(status, body))
+        for status in (400, 401, 403, 404, 429, 503):
+            def responder(req, timeout=None):
+                error = urllib.error.HTTPError(req.full_url, status, SECRET, {}, io.BytesIO(SECRET.encode()))
+                error.read = mock.Mock(side_effect=AssertionError("must not read provider error body"))
+                raise error
+            code, call, out, err = self.run_weekly(responder)
             self.assertEqual(code, 1)
-            self.assertEqual(m.call_count, 2 if status == 429 else 1)  # 429のみ再試行（400/403/404は再試行しない）
-            self.assertEqual(set(self.urls), {GEMINI_URL})  # 別モデルへのフォールバックなし
-            line = next(ln for ln in err.splitlines() if ln.startswith("ERROR: Gemini API request failed"))
-            self.assertIn(f"model=gemini-3.8-flash): HTTP {status} status={body['error']['status']}", line)
-            self.assertLess(len(line), 400)
+            self.assertEqual(call.call_count, 2 if status in (429, 503) else 1)
+            self.assertIn(f"HTTP {status}", err)
+            self.assertNotIn(SECRET, out + err)
             self.assertFalse(self.output().exists())
-            if status == 404:
-                self.assertIn("GEMINI_MODEL を確認してください", out)
-        self.assertIn("***", self.go(http_error(403, bodies[403]))[3])
-        code, _, _, err = self.go(http_error(500, b"<html>Internal error</html>"))
-        self.assertIn("HTTP 500", err)
-        self.assertNotIn("Internal error", err)  # JSONでない本文は出さない
 
-    def test_model_can_be_changed_by_env_without_fallback(self):
+    def test_gemini_model_settings_do_not_change_weekly_provider(self):
         self.week42()
-        env = {"GEMINI_API_KEY": SECRET, "GEMINI_MODEL": "models/gemini-3-flash-preview"}
-        code, _, out, err = self.go(completion(review()), env=env)
-        self.assertEqual(code, 0, err)
-        self.assertEqual(self.urls, ["https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent"])
-        self.assertIn("Model: gemini-3-flash-preview", out)
-        self.assertIn("生成モデル：gemini-3-flash-preview", self.output().read_text(encoding="utf-8"))
+        for value in ("gemini-3.6-flash", "models/gemini-x", "../invalid?key=x"):
+            code, call, out, err = self.run_weekly(lambda *a, **k: FakeResponse(plamo_completion(review())),
+                env={"PLAMO_API_KEY": SECRET, "GEMINI_API_KEY": SECRET, "GEMINI_MODEL": value}, force=True)
+            self.assertEqual((code, call.call_count), (0, 1), err)
+            self.assertEqual(call.call_args.args[0].full_url, PLAMO_URL)
+            self.assertIn("Model: plamo-3.1-prime", out)
+            self.assertIn("生成モデル：plamo-3.1-prime", self.output().read_text())
 
-    def test_invalid_model_name_stops_before_api(self):
-        self.week42()
-        for model in ("../v1/models/x", "gemini 2.5", "gemini-3.8-flash:generateContent?key=x"):
-            code, m, _, err = self.run_weekly(lambda *a, **k: self.fail("called"),
-                                              env={"GEMINI_API_KEY": SECRET, "GEMINI_MODEL": model})
-            self.assertEqual(code, 2, model)
-            m.assert_not_called()
-            self.assertIn("GEMINI_MODEL", err)
 
-    def test_existing_review_is_skipped_without_api_call(self):
-        self.week42()
-        self.output().parent.mkdir(parents=True)
-        self.output().write_text("既存の週刊\n", encoding="utf-8")
-        code, m, out, _ = self.run_weekly(lambda *a, **k: self.fail("called"))
-        self.assertEqual((code, m.call_count), (0, 0))
-        self.assertIn("API requests: 0", out)
+class GeminiCompatibility(unittest.TestCase):
+    def test_extract_text_still_ignores_thoughts_and_rejects_incomplete_output(self):
+        text = json.dumps(review())
+        payload = {"candidates": [{"finishReason": "STOP", "content": {"parts": [
+            {"text": "internal", "thought": True}, {"text": text[:20]}, {"text": text[20:]}]}}]}
+        self.assertEqual(weekly.extract_text(payload), text)
+        for data in ({"candidates": []}, completion(review(), finish_reason="MAX_TOKENS"),
+                     completion(review(), finish_reason="SAFETY")):
+            with self.assertRaises(weekly.ValidationError):
+                weekly.extract_text(data)
+
+    def test_gemini_resolver_used_by_monthly_remains_compatible(self):
+        self.assertEqual(weekly.resolve_model({"GEMINI_MODEL": "models/gemini-x-pro"}), "gemini-x-pro")
+        self.assertEqual(weekly.resolve_model({}), "gemini-3.8-flash")
+        for value in ("../v1/models/x", "gemini 2.5", "gemini-x:generateContent?key=x"):
+            with self.assertRaises(weekly.WeeklyError):
+                weekly.resolve_model({"GEMINI_MODEL": value})
 
 
 # ---- 一時的なエラーの再試行 ---------------------------------------------------------------
@@ -528,29 +500,30 @@ class Retry(Base):
         self.assertNotIn("x-goog-api-key", (out + err).lower())
 
     def test_success_on_first_request_does_not_retry(self):
-        code, m, out, err = self.go(completion(review()))
+        code, m, out, err = self.go(plamo_completion(review()))
         self.assertEqual((code, m.call_count), (0, 1), err)
         self.sleep.assert_not_called()
-        self.assertIn("API attempt 1/2: model=gemini-3.8-flash status=200", out)
+        self.assertIn("API attempt 1/2: model=plamo-3.1-prime status=200", out)
         self.assertIn("API requests: 1", out)
         self.assert_no_leak(out, err)
 
     def test_503_then_success_takes_two_requests(self):
         body = {"error": {"code": 503, "status": "UNAVAILABLE", "message": f"overloaded {SECRET}"}}
-        code, m, out, err = self.go(http_error(503, body, secret_in_message=True), completion(review()))
+        code, m, out, err = self.go(http_error(503, body, secret_in_message=True), plamo_completion(review()))
         self.assertEqual((code, m.call_count), (0, 2), err)
         self.sleep.assert_called_once_with(weekly.RETRY_WAIT_SEC)
         self.assertTrue(self.output().exists())
-        self.assertIn("API attempt 1/2: model=gemini-3.8-flash status=503", out)
+        self.assertIn("API attempt 1/2: model=plamo-3.1-prime status=503", out)
         self.assertIn("retry=yes", out)
-        self.assertIn("API attempt 2/2: model=gemini-3.8-flash status=200", out)
+        self.assertIn("API attempt 2/2: model=plamo-3.1-prime status=200", out)
         self.assertIn("API requests: 2", out)
         self.assertIn("retrying once", out)
-        self.assertIn("HTTP 503 status=UNAVAILABLE", out)
+        self.assertIn("HTTP 503", out)
+        self.assertNotIn("overloaded", out + err)
         self.assert_no_leak(out, err)
 
     def test_timeout_then_success_takes_two_requests(self):
-        code, m, out, err = self.go(TimeoutError(SECRET), completion(review()))
+        code, m, out, err = self.go(TimeoutError(SECRET), plamo_completion(review()))
         self.assertEqual((code, m.call_count), (0, 2), err)
         self.assertIn("status=timeout", out)
         self.assertIn("API requests: 2", out)
@@ -563,7 +536,7 @@ class Retry(Base):
             weekly.http.client.IncompleteRead(b"x")]
         for e in failures:
             with self.subTest(error=repr(e)):
-                code, m, _, err = self.go(e, completion(review()))
+                code, m, _, err = self.go(e, plamo_completion(review()))
                 self.assertEqual((code, m.call_count), (0, 2), err)
                 self.output().unlink()
 
@@ -586,15 +559,15 @@ class Retry(Base):
         self.assertEqual((code, m.call_count), (1, 2))
         self.sleep.assert_called_once()
         self.assertIn("API requests: 2", out)
-        self.assertIn("API attempt 2/2: model=gemini-3.8-flash status=timeout", out)
+        self.assertIn("API attempt 2/2: model=plamo-3.1-prime status=timeout", out)
         self.assertIn("retry=no", out.splitlines()[[i for i, ln in enumerate(out.splitlines()) if "attempt 2/2" in ln][0]])
-        self.assertIn("ERROR: Gemini API request failed (model=gemini-3.8-flash): TimeoutError", err)
+        self.assertIn("ERROR: PLaMo API request failed (model=plamo-3.1-prime): TimeoutError", err)
         self.assertFalse(self.output().exists())
         self.assertFalse(self.weeks.exists())
 
     def test_invalid_response_is_not_retried(self):
-        for payload in (b"<html>", completion("{broken"), {"candidates": []}):
-            code, m, _, _ = self.go(payload, completion(review()))
+        for payload in (b"<html>", plamo_completion("{broken"), {"candidates": []}):
+            code, m, _, _ = self.go(payload, plamo_completion(review()))
             self.assertEqual((code, m.call_count), (1, 1))
             self.sleep.assert_not_called()
 
@@ -602,7 +575,7 @@ class Retry(Base):
         self.week42()
         clock = iter([0, 0, 300, 300])  # 初回に300秒かかった → 待機＋再試行で上限を超える
         with mock.patch.object(weekly.time, "monotonic", side_effect=lambda: next(clock)):
-            code, m, out, _ = self.run_weekly(self.sequence(TimeoutError(), completion(review())))
+            code, m, out, _ = self.run_weekly(self.sequence(TimeoutError(), plamo_completion(review())))
         self.assertEqual((code, m.call_count), (1, 1))
         self.assertIn("retry=no", out)
 
@@ -640,7 +613,7 @@ class BackfillFixture(Base):
             (self.output(label)).write_text(f"既存の{label}\n", encoding="utf-8")
 
     def go(self, week=None, force=False, env=None, responder=None):
-        responder = responder or (lambda *a, **k: FakeResponse(completion(review())))
+        responder = responder or (lambda *a, **k: FakeResponse(plamo_completion(review())))
         return self.run_weekly(responder, today=self.TODAY, week=week, force=force, env=env)
 
     def files(self):
@@ -774,7 +747,7 @@ class Backfill(BackfillFixture):
 class StepSummary(BackfillFixture):
     def summary_env(self, event="schedule"):
         self.summary_path = Path(self.tmp.name) / "summary.md"
-        return {"GEMINI_API_KEY": SECRET, "GITHUB_STEP_SUMMARY": str(self.summary_path), "GITHUB_EVENT_NAME": event}
+        return {"PLAMO_API_KEY": SECRET, "GITHUB_STEP_SUMMARY": str(self.summary_path), "GITHUB_EVENT_NAME": event}
 
     def text(self):
         return self.summary_path.read_text(encoding="utf-8")
@@ -782,14 +755,14 @@ class StepSummary(BackfillFixture):
     def test_scheduled_backfill_summary(self):
         self.logs_for("2026-W41", "2026-W42", "2026-W43")
         self.existing("2026-W41")
-        usage = {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
         code, m, _, err = self.go(env=self.summary_env(), responder=self.seq(
-            http_error(503, {"error": {"status": "UNAVAILABLE", "message": f"busy {SECRET}"}}), completion(review(), usage=usage)))
+            http_error(503, {"error": {"status": "UNAVAILABLE", "message": f"busy {SECRET}"}}), plamo_completion(review(), usage=usage)))
         self.assertEqual(code, 0, err)
         text = self.text()
         for expected in ("### Weekly review", "| 対象 | 2026-W42 |", "| 実行種別 | 定期 |", "| 区分 | 欠号補完 |",
-                         "| 入力記事数 | 1件 |", "| 利用モデル | gemini-3.8-flash |", "| APIリクエスト回数 | 2回", "| 結果 | 成功 |",
-                         "total=15", "| 再試行 | 初回失敗（HTTP 503 status=UNAVAILABLE message=busy ***）のため1回再試行 |"):
+                         "| 入力記事数 | 1件 |", "| 利用モデル | plamo-3.1-prime |", "| APIリクエスト回数 | 2回", "| 結果 | 成功 |",
+                         "total=15", "| 再試行 | 初回失敗（HTTP 503）のため1回再試行 |"):
             self.assertIn(expected, text)
         self.assertNotIn(SECRET, text)
 
@@ -806,6 +779,11 @@ class StepSummary(BackfillFixture):
                          "| 結果 | 失敗 |", "| エラー概要 | TimeoutError |"):
             self.assertIn(expected, text)
         self.assertNotIn(SECRET, text)
+        code, m, _, _ = self.go(week="2026-W42", env=self.summary_env("workflow_dispatch"),
+                                responder=self.seq(http_error(429, SECRET.encode()), http_error(429, SECRET.encode())))
+        self.assertEqual((code, m.call_count), (1, 2))
+        self.assertIn("HTTP 429 (rate_limited)", self.text())
+        self.assertNotIn(SECRET, self.text())
 
     def test_skip_summaries(self):
         self.logs_for("2026-W42")
@@ -822,12 +800,12 @@ class StepSummary(BackfillFixture):
         self.assertIn("| 結果 | 失敗 |", self.text())
         self.assertIn("存在しない週です", self.text())
         self.logs_for("2026-W42")
-        code, *_ = self.go(env={"GEMINI_API_KEY": SECRET})  # GITHUB_STEP_SUMMARY が無ければ何も書かない
+        code, *_ = self.go(env={"PLAMO_API_KEY": SECRET})  # GITHUB_STEP_SUMMARY が無ければ何も書かない
         self.assertEqual(code, 0)
 
     def test_unwritable_summary_does_not_fail_generation(self):
         self.logs_for("2026-W42")
-        env = {"GEMINI_API_KEY": SECRET, "GITHUB_STEP_SUMMARY": str(Path(self.tmp.name) / "no" / "dir" / "s.md")}
+        env = {"PLAMO_API_KEY": SECRET, "GITHUB_STEP_SUMMARY": str(Path(self.tmp.name) / "no" / "dir" / "s.md")}
         code, m, out, err = self.go(env=env)
         self.assertEqual(code, 0, err)
         self.assertIn("Could not write the step summary", out)
@@ -942,8 +920,9 @@ class RepoLayout(unittest.TestCase):
         self.assertEqual(wf["concurrency"]["group"], "reviews")  # 月刊と直列（collect-news とは別）
         self.assertIn("git add reviews/weekly", text)
         self.assertNotRegex(text, r"git add weekly|\[ -d weekly \]")  # 旧保存先へは書き込まない
-        self.assertIn("GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}", text)
-        self.assertIn("GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}", text)
+        self.assertIn("PLAMO_API_KEY: ${{ secrets.PLAMO_API_KEY }}", text)
+        generation = next(step for step in wf["jobs"]["weekly"]["steps"] if step.get("name") == "Generate weekly review")
+        self.assertEqual(set(generation["env"]), {"PLAMO_API_KEY", "WEEK", "REGENERATE"})
         self.assertNotIn("SARASHINA", text)
         self.assertNotIn("BRAVE_API_KEY", text)
         self.assertNotIn("JEV_API_KEY", text)
