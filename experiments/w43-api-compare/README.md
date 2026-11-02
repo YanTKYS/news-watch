@@ -1,6 +1,8 @@
 # W43 API比較PoC
 
-[Issue #29](https://github.com/YanTKYS/news-watch/issues/29) のGemini `gemini-3.6-flash` / PLaMo `plamo-3.1-prime` 比較用。**実APIは未実施。** 本番のモデル変数・週刊/月刊コード・定期workflow・レビュー・インデックスは変更しない。結果・採用判断は [evaluation.md](evaluation.md) に記録する。
+[Issue #29](https://github.com/YanTKYS/news-watch/issues/29) のGemini `gemini-3.6-flash` / PLaMo `plamo-3.1-prime` 比較用。**2026-11-02の実API比較は両モデルとも成功し、PoCは完了。** その後の運用判断で週刊はPLaMoへ切替済み、月刊はGeminiを維持している。証跡・採用理由・本番反映結果は [evaluation.md](evaluation.md) を参照。
+
+以下は実装・検証時の手順を残したもの。追加比較の実行やPoC拡張を指示するものではなく、本PoC自体は本番のモデル変数・コード・レビュー・インデックスを更新しない。本番切替は別途PR #34で行った。
 
 ## 固定入力と再利用
 
