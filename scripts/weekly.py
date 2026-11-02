@@ -4,10 +4,11 @@
 - 入力は既存の logs/YYYY/YYYY-MM.md のみ（Brave/Jevの再検索はしない）。取得日 Retrieved で対象週を抽出する。
 - 週の指定がなければ、直近 BACKFILL_WEEKS 週のうち未生成の最も古い週（記事がある週）を1回の実行で1週だけ生成する
   （前週が未生成なら前週＝通常生成、それ以前なら欠号補完）。--week 指定時はその週だけを処理する。
-- Gemini API（generateContent）は1週につき通常1リクエスト。一時的なエラー（429/500/502/503/504・タイムアウト等）に限り
+- PLaMo API（plamo-3.1-prime）は1週につき通常1リクエスト。一時的なエラー（429/500/502/503/504・タイムアウト等）に限り
   1回だけ再試行する（最大 MAX_API_ATTEMPTS 回。自動修復・別モデルへの切り替えなし）。
-  生成済みの週は --force 指定時のみ再生成する。モデルは環境変数 GEMINI_MODEL で変更できる。
-- APIキーは環境変数 GEMINI_API_KEY からのみ取得する（URL・ログ・ファイルに出さない）。
+  生成済みの週は --force 指定時のみ再生成する。週刊は GEMINI_MODEL を参照しない。
+- 週刊APIキーは環境変数 PLAMO_API_KEY からのみ取得する（URL・ログ・ファイルに出さない）。
+- 月刊とPoCが使うGemini用関数・モデル解決は互換性を維持する。
 - AIの出力（JSON）はPythonで検証し、出典URLは検証済みの記事IDからPython側で付与する。
 - 日刊ログ・seen.json は読み取りのみで、変更しない。
 """
@@ -29,10 +30,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import topic_dedup
+import plamo_api
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# ---- Gemini API（利用量のハードリミット） ----------------------------------------
+# ---- Gemini互換関数（月刊・比較PoC用）と共通の利用量上限 ---------------------------
 API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 DEFAULT_MODEL = "gemini-3.8-flash"  # 環境変数 GEMINI_MODEL で上書きできる（自動フォールバックはしない）
 MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,99}$")
@@ -575,6 +577,62 @@ def request_gemini(request: urllib.request.Request, api_key: str, model: str, la
         print(f"API requests: {stats.requests}")
 
 
+def build_plamo_request(week: Week, articles: list[Article], api_key: str) -> urllib.request.Request:
+    return plamo_api.build_request(SYSTEM_PROMPT, build_user_prompt(week, articles),
+                                   response_schema([a.id for a in articles]), api_key,
+                                   max_tokens=MAX_OUTPUT_TOKENS, user_agent=USER_AGENT)
+
+
+def request_plamo(request: urllib.request.Request, stats: ApiStats | None = None) -> str | None:
+    """Weekly production only: at most two attempts within the existing time budget."""
+    stats = stats if stats is not None else ApiStats()
+    started = time.monotonic()
+    try:
+        for attempt in range(1, MAX_API_ATTEMPTS + 1):
+            stats.requests = attempt
+            t0 = time.monotonic()
+            try:
+                data = plamo_api.call_api(request, timeout=TIMEOUT_SEC, max_response_bytes=MAX_RESPONSE_BYTES)
+                tokens = plamo_api.usage_tokens(data)
+                names = {"prompt_tokens": "prompt", "completion_tokens": "output", "total_tokens": "total"}
+                stats.tokens = {names[k]: v for k, v in tokens.items()}
+                if stats.tokens:
+                    print("Tokens: " + ", ".join(f"{k}={v}" for k, v in stats.tokens.items()))
+                text = plamo_api.extract_text(data)
+            except plamo_api.PlamoError as error:
+                stats.status, stats.error = str(error.http_status), f"invalid PLaMo response: {error}"
+                print(f"API attempt {attempt}/{MAX_API_ATTEMPTS}: model={plamo_api.MODEL} status={stats.status} elapsed={time.monotonic() - t0:.1f}s")
+                print(f"ERROR: invalid API response; weekly review was not saved: {error}", file=sys.stderr)
+                return None
+            except Exception as error:
+                now = time.monotonic()
+                stats.status = error_status(error)
+                # Do not parse provider error bodies or echo arbitrary exception text.
+                if isinstance(error, urllib.error.HTTPError):
+                    stats.error = f"HTTP {error.code}" + (" (rate_limited)" if error.code == 429 else "")
+                    error.close()
+                else:
+                    stats.error = type(error).__name__
+                retry = (is_transient(error) and attempt < MAX_API_ATTEMPTS
+                         and now - started + RETRY_WAIT_SEC + TIMEOUT_SEC <= API_BUDGET_SEC)
+                print(f"API attempt {attempt}/{MAX_API_ATTEMPTS}: model={plamo_api.MODEL} status={stats.status} "
+                      f"elapsed={now - t0:.1f}s transient={'yes' if is_transient(error) else 'no'} retry={'yes' if retry else 'no'}")
+                if retry:
+                    stats.retry_reason = stats.error
+                    print(f"::warning::PLaMo API request failed ({stats.error}); retrying once in {RETRY_WAIT_SEC}s")
+                    time.sleep(RETRY_WAIT_SEC)
+                    continue
+                print(f"ERROR: PLaMo API request failed (model={plamo_api.MODEL}): {stats.error}", file=sys.stderr)
+                return None
+            stats.status, stats.error = "200", ""
+            print(f"API attempt {attempt}/{MAX_API_ATTEMPTS}: model={plamo_api.MODEL} status=200 elapsed={time.monotonic() - t0:.1f}s")
+            return text
+        return None
+    finally:
+        stats.elapsed = time.monotonic() - started
+        print(f"API requests: {stats.requests}")
+
+
 def describe_error(e: Exception, secret: str = "") -> str:
     """HTTPエラーは本文（{"error": {code, status, message}}）から安全な概要だけを取り出す。本文全体は出さない。"""
     if not isinstance(e, urllib.error.HTTPError):
@@ -622,6 +680,8 @@ def validate_review(content: str, valid_ids: set[str]) -> Review:
     for key in ("overview", "topics", "closing"):
         if key not in data:
             raise ValidationError(f"missing field: {key}")
+    if set(data) != {"overview", "topics", "closing"}:
+        raise ValidationError("unexpected root fields")
     overview = _text(data, "overview", "root")
     closing = _text(data, "closing", "root")
     raw_topics = data["topics"]
@@ -633,6 +693,8 @@ def validate_review(content: str, valid_ids: set[str]) -> Review:
         where = f"topics[{i}]"
         if not isinstance(t, dict):
             raise ValidationError(f"{where} must be an object")
+        if set(t) - {"title", "summary", "implication", "source_ids"}:
+            raise ValidationError(f"{where} has unexpected fields")
         ids = t.get("source_ids")
         if not isinstance(ids, list) or not ids or not all(isinstance(x, str) for x in ids):
             raise ValidationError(f"{where}.source_ids must be a non-empty list of strings")
@@ -799,7 +861,7 @@ def run(
     env: dict | None = None,
 ) -> int:
     env = os.environ if env is None else env
-    summary = RunSummary()
+    summary = RunSummary(model=plamo_api.MODEL)
     try:
         return _run(summary, week_arg, force, logs_dir, weekly_dir, weeks_path, today, env)
     except Exception as e:  # 想定外の例外でも実行サマリーに残す（例外はそのまま再送出する）
@@ -813,7 +875,7 @@ def _run(summary: RunSummary, week_arg, force, logs_dir, weekly_dir, weeks_path,
     today_d = date.fromisoformat(today) if today else datetime.now(JST).date()
     explicit = week_arg is not None
     try:
-        model = summary.model = resolve_model(env)
+        model = summary.model = plamo_api.MODEL
         week = parse_week(week_arg) if explicit else previous_week(today_d)
         if week.end >= today_d:
             raise WeeklyError(f"{week.label} はまだ終わっていません（対象は終了した週のみ）")
@@ -897,18 +959,20 @@ def _run(summary: RunSummary, week_arg, force, logs_dir, weekly_dir, weeks_path,
     print(f"Same-topic candidate pairs (hint only, not removed): {pairs}")
     print(f"Model: {model}")
 
-    api_key = (env.get("GEMINI_API_KEY") or "").strip()
+    api_key = (env.get("PLAMO_API_KEY") or "").strip()
     if not api_key:
-        summary.note = "GEMINI_API_KEY が未設定です"
-        print("ERROR: 環境変数 GEMINI_API_KEY が設定されていません。"
+        summary.note = "PLAMO_API_KEY が未設定です"
+        print("ERROR: 環境変数 PLAMO_API_KEY が設定されていません。"
               "GitHub の Settings → Secrets and variables → Actions で登録してください。", file=sys.stderr)
         return 2
 
-    data = request_gemini(build_request(week, selected, api_key, model), api_key, model, "weekly review", summary.api)
-    if data is None:
+    text = request_plamo(build_plamo_request(week, selected, api_key), summary.api)
+    if text is None:
         return 1
     try:
-        review = validate_review(extract_text(data), {a.id for a in selected})
+        if api_key in text:
+            raise ValidationError("credential in output")
+        review = validate_review(text, {a.id for a in selected})
     except ValidationError as e:
         summary.api.error = f"invalid API output: {sanitize(e, api_key)}"
         print(f"ERROR: invalid API output; weekly review was not saved: {sanitize(e, api_key)}", file=sys.stderr)
