@@ -128,6 +128,9 @@
   "https://news.yahoo.co.jp/articles/41cf5c3f25c1431b1e8454c12435c55bfed75a94": {
     "first_seen": "2026-09-30"
   },
+  "https://news.yahoo.co.jp/articles/4493236a3b33a128305cf369ca69bdd995f5a220": {
+    "first_seen": "2026-11-02"
+  },
   "https://news.yahoo.co.jp/articles/56cb5c67c741a2382eebab4d6857e48d00a13adb": {
     "first_seen": "2026-10-30"
   },
@@ -217,6 +220,9 @@
   },
   "https://prtimes.jp/main/html/rd/p/000000779.000088829.html": {
     "first_seen": "2026-10-07"
+  },
+  "https://prtimes.jp/main/html/rd/p/000000796.000088829.html": {
+    "first_seen": "2026-11-02"
   },
   "https://prtimes.jp/main/html/rd/p/000000876.000059164.html": {
     "first_seen": "2026-10-28"
