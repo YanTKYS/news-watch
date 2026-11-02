@@ -65,7 +65,7 @@ API試験に進んだ場合、Geminiが503・タイムアウト・構造不正�
 
 ## 回収と評価
 
-Artifact名は `w43-comparison-RUN_ID-RUN_ATTEMPT`。成否を問わず、両モデルの次のファイルと `comparison/` の診断だけを1つに回収する（保持14日）。保持期限に頼らず、実行URLと主要指標・人手評価は後続PRで `evaluation.md` に残す。
+Artifact名は `w43-comparison-RUN_ID-RUN_ATTEMPT`。成否を問わず、両モデルの次のファイルと `comparison/` の診断だけを1つに回収する。保持期間は10日（リポジトリ上限による）。保持期限に頼らず、実行URLと主要指標・人手評価は後続PRで `evaluation.md` に残す。
 
 - `input-manifest.json`: 入力順・ID/URL対応、ハッシュ、スキーマ調整記録。
 - `metrics.json`: 固定モデル、HTTP、送信試行回数、秒数、usage、完了理由、検証成否、失敗stage。未知の完了理由は `other` にし、任意文字列を転記しない。

@@ -9,7 +9,7 @@
 [Issue #29](https://github.com/YanTKYS/news-watch/issues/29) / PR #30・#32で、取得日2026-10-19〜25の26記事、ID・URL・順序・system/userプロンプト・JSON Schemaを固定した。入力とハッシュの定義は[README](README.md#固定入力と再利用)を正本とする。記事本文の追加取得やWeb検索は行わない。
 
 - [比較実行 #41461518681](https://github.com/YanTKYS/news-watch/actions/runs/41461518681)：2026-11-02 23:23 JST頃に手動起動、`main`、実行結果 `success`（Actions APIで確認）。
-- [Artifact `w43-comparison-41461518681-1`](https://github.com/YanTKYS/news-watch/actions/runs/41461518681/artifacts/13148249564)：両モデルのmanifest・指標・候補と比較表の保存先。保持期間は14日。
+- [Artifact `w43-comparison-41461518681-1`](https://github.com/YanTKYS/news-watch/actions/runs/41461518681/artifacts/13148249564)：両モデルのmanifest・指標・候補と比較表の保存先。保持期間は10日（リポジトリ上限による）。
 - HTTP・試行数・検証結果は[利用者の結果整理コメント](https://github.com/YanTKYS/news-watch/issues/29#issuecomment-6581124999)に基づく。本改訂ではArtifactの存在・未期限切れをAPIで確認したが、配布先への通信が403で拒否され、内容を再取得できなかった。**正確な所要時間・usageは推測して転載せず、既存Artifactを参照先とする。**
 
 | 項目 | Gemini 3.6 Flash | PLaMo 3.1 Prime |
