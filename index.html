@@ -54,7 +54,10 @@
     </div>
   </header>
   <main class="wrap">
-    <div id="status" role="status" aria-live="polite">読み込み中...</div>
+    <div class="status-row">
+      <div id="status" role="status" aria-live="polite" tabindex="-1">読み込み中...</div>
+      <button type="button" id="retry" class="retry" hidden>再試行</button>
+    </div>
     <div id="content"></div>
   </main>
   <noscript><p class="wrap">このページの表示にはJavaScriptが必要です。ログは <a href="logs/">logs/</a>、週刊・月刊レビューは <a href="reviews/">reviews/</a> のMarkdownで直接読めます。</p></noscript>

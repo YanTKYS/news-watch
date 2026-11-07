@@ -18,6 +18,7 @@ const modeButtons = {
 const searchInput = document.getElementById("search-input");
 const searchClear = document.getElementById("search-clear");
 const statusEl = document.getElementById("status");
+const retryButton = document.getElementById("retry");
 const content = document.getElementById("content");
 let loadToken = 0; // 連続切替時に古い応答で上書きしない（日刊・週刊・月刊で共通）
 let sortOrder = "desc"; // "desc"=新しい順 / "asc"=古い順（月を切り替えても維持。永続化はしない）
@@ -29,6 +30,24 @@ let searchQuery = ""; // 検索中のキーワード（空なら通常の日刊�
 let searchEntries = null; // buildSearchEntries の結果（初回検索時に読み込み、以後は再利用）
 let searchLoading = null; // 読み込み中の Promise（同時に複数回取得しない）
 let searchTimer = 0;
+let dailyMonth = ""; // URLや月選択で指定された日刊の月（空なら最新月）
+const reviewIds = { weekly: "", monthly: "" }; // 表示中（または指定された）レビューのID
+let editingQuery = false; // 入力途中の検索語は、連続入力の間は1つの履歴にまとめる
+let retryAction = null;
+let retryFocus = false; // 再試行後、成功したら見出し・失敗したら再試行ボタンへフォーカスを戻す
+// 同じページ内で同じ月・検索語へ戻ったとき、開いていた日付と追加表示件数を再現する一時メモ（永続化しない）。
+const readingMemory = new Map();
+const QUERY_MAX = 200;
+let restoreScroll = false; // 戻る・日刊への切替で戻ったときだけ、記録した閲覧位置へ戻す
+let restoringScroll = false;
+
+function remember(key, patch) {
+  readingMemory.set(key, { ...readingMemory.get(key), ...patch });
+}
+
+function dailyKey() {
+  return searchQuery ? `search:${searchQuery}` : `month:${select.value}`;
+}
 
 // 週刊・月刊の設定。一覧（index）は初めてそのタブを開いたときに読む。
 const REVIEWS = {
@@ -69,10 +88,31 @@ function el(tag, className, text) {
   return node;
 }
 
-function setStatus(message, isError) {
+// retry を渡すと、状態欄の隣に「再試行」を出す。quiet は画面に出さず読み上げだけ行う通知。
+function setStatus(message, isError = false, retry = null, quiet = false) {
   statusEl.textContent = message;
-  statusEl.className = isError ? "error" : "";
+  statusEl.className = isError ? "error" : quiet ? "visually-hidden" : "";
   statusEl.hidden = !message;
+  retryAction = retry;
+  retryButton.hidden = !retry;
+  if (retry && retryFocus) { retryFocus = false; retryButton.focus(); }
+}
+
+// 描画の完了時に呼ぶ。再試行から成功した場合だけ、表示した内容の見出しへフォーカスを移す。
+function finishRender() {
+  const scroll = restoreScroll && mode === "daily" ? readingMemory.get(dailyKey())?.scroll : undefined;
+  restoreScroll = false;
+  if (scroll !== undefined) {
+    window.scrollTo(0, scroll);
+    // 戻る操作ではブラウザ標準の位置復元が後から働くため、次の描画前に合わせ直す。
+    restoringScroll = true;
+    requestAnimationFrame(() => { window.scrollTo(0, scroll); restoringScroll = false; });
+  }
+  if (!retryFocus) return;
+  retryFocus = false;
+  if (document.activeElement !== statusEl && document.activeElement !== document.body) return; // 利用者が別の操作へ移った
+  const heading = content.querySelector("h2");
+  if (heading) { heading.tabIndex = -1; heading.focus(); }
 }
 
 async function fetchText(path) {
@@ -80,6 +120,13 @@ async function fetchText(path) {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.text();
 }
+
+// 説明文が3行に収まらないカードだけ「もっと見る」を表示する（閉じた日付を開いたときにも判定される）。
+const descObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver((entries) => {
+  for (const { target } of entries) {
+    if (!target.classList.contains("expanded")) target.nextElementSibling.hidden = target.scrollHeight <= target.clientHeight + 1;
+  }
+});
 
 function renderCard(item) {
   const card = el("article", "card");
@@ -97,11 +144,26 @@ function renderCard(item) {
   }
   card.appendChild(title);
 
-  // 「example.jp ・ 2026-10-01」。どちらかが欠けても、あるものだけを表示する。
-  const metaText = [item.source, item.published].filter(Boolean).join(" ・ ");
+  // 「example.jp ・ 公開日 2026-10-01」。どちらかが欠けても、あるものだけを表示する。
+  const metaText = [item.source, item.published && `公開日 ${item.published}`].filter(Boolean).join(" ・ ");
   if (metaText) card.appendChild(el("p", "meta", metaText));
 
-  if (item.description) card.appendChild(el("p", "desc", item.description));
+  if (item.description) {
+    // 初期表示は3行まで。省略されたカードだけ「もっと見る」を出し、保存済みの説明全文を読めるようにする。
+    const desc = el("p", "desc", item.description);
+    const toggle = el("button", "desc-toggle", "説明をもっと見る");
+    toggle.type = "button";
+    toggle.hidden = true;
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.addEventListener("click", () => {
+      const expanded = desc.classList.toggle("expanded");
+      toggle.textContent = expanded ? "説明を閉じる" : "説明をもっと見る";
+      toggle.setAttribute("aria-expanded", String(expanded));
+    });
+    card.appendChild(desc);
+    card.appendChild(toggle);
+    if (descObserver) descObserver.observe(desc);
+  }
 
   // リンクと補助情報はカード下部にまとめ、行内のカードで位置を揃える。
   const bottom = el("div", "card-bottom");
@@ -117,9 +179,7 @@ function renderCard(item) {
     if (item.retrieved) parts.push(`取得日: ${item.retrieved}`);
     if (item.theme) parts.push(`テーマ: ${item.theme}`); // 検索結果のみ（日刊表示ではテーマは見出し）
     if (item.queries) parts.push(`検索語: ${item.queries}`);
-    const foot = el("p", "foot", parts.join(" / "));
-    foot.title = parts.join(" / "); // 1行表示で省略された場合に全文を確認できる
-    bottom.appendChild(foot);
+    bottom.appendChild(el("p", "foot", parts.join(" / "))); // 狭幅でも省略せず折り返す
   }
   if (bottom.childNodes.length) card.appendChild(bottom);
   return card;
@@ -137,8 +197,12 @@ function countItems(themes) {
 
 function renderMonth(ym, days, order) {
   const total = days.reduce((n, d) => n + countItems(d.themes), 0);
-  // 初期展開するのは、並び順に関係なくその月の最新日のみ
+  // 初期展開するのは、並び順に関係なくその月の最新日のみ（同じページ内で開閉済みならその状態を再現）
   const latest = days.reduce((max, d) => (d.date > max ? d.date : max), "");
+  const memoryKey = `month:${ym}`;
+  const opened = readingMemory.get(memoryKey)?.opened;
+  const sections = [];
+  if (descObserver) descObserver.disconnect();
   const frag = document.createDocumentFragment();
 
   const head = el("div", "month-head");
@@ -148,11 +212,18 @@ function renderMonth(ym, days, order) {
 
   for (const day of sortDays(days, order)) {
     const section = el("details", "day");
-    section.open = day.date === latest;
+    section.open = opened ? opened.includes(day.date) : day.date === latest;
+    sections.push({ section, date: day.date });
+    section.addEventListener("toggle", () => {
+      if (content.contains(section)) remember(memoryKey, { opened: sections.filter((s) => s.section.open).map((s) => s.date) });
+    });
     const summary = el("summary", "day-summary");
-    summary.appendChild(el("span", "day-title", dateLabel(day.date)));
+    const title = el("span", "day-title");
+    title.appendChild(el("span", "day-label", "取得日"));
+    title.appendChild(el("span", "day-date", dateLabel(day.date)));
+    summary.appendChild(title);
     summary.appendChild(el("span", "count", `${countItems(day.themes)}件`));
-    if (latest && day.date === latest) summary.appendChild(el("span", "latest", "最新")); // 日付値で判定（並び順に依存しない）
+    if (latest && day.date === latest) summary.appendChild(el("span", "latest", "この月の最新")); // 日付値で判定（並び順に依存しない）
     section.appendChild(summary);
     for (const theme of day.themes) {
       const block = el("div", "theme");
@@ -167,6 +238,7 @@ function renderMonth(ym, days, order) {
     frag.appendChild(section);
   }
   content.replaceChildren(frag);
+  finishRender();
 }
 
 async function showMonth(ym) {
@@ -179,7 +251,7 @@ async function showMonth(ym) {
   try {
     text = await fetchText(`logs/${ym.slice(0, 4)}/${ym}.md`);
   } catch (e) {
-    if (token === loadToken) setStatus(`${monthLabel(ym)}のログを取得できませんでした。`, true);
+    if (token === loadToken) setStatus(`${monthLabel(ym)}のログを取得できませんでした。`, true, () => showMonth(ym));
     return;
   }
   if (token !== loadToken) return;
@@ -187,7 +259,7 @@ async function showMonth(ym) {
   try {
     days = parseLog(text);
   } catch (e) {
-    setStatus(`${monthLabel(ym)}のログを解析できませんでした。`, true);
+    setStatus(`${monthLabel(ym)}のログを解析できませんでした。`, true, () => showMonth(ym));
     return;
   }
   if (days.length === 0) {
@@ -205,7 +277,18 @@ async function startDaily() {
   content.replaceChildren();
   setStatus("読み込み中...");
   if (!select.options.length) await loadMonths(token);
-  if (token === loadToken && select.value) showMonth(select.value); // months.json は新しい順。先頭=最新月
+  if (token !== loadToken || !select.value) return;
+  selectDailyMonth();
+  commitURL("replace");
+  if (searchQuery) showSearch();
+  else showMonth(select.value); // months.json は新しい順。先頭=最新月
+}
+
+// 指定された月を選ぶ。一覧にない月・未指定なら最新月。
+function selectDailyMonth() {
+  const exists = [...select.options].some((o) => o.value === dailyMonth);
+  select.value = exists ? dailyMonth : select.options[0].value;
+  dailyMonth = select.value;
 }
 
 async function loadMonths(token) {
@@ -215,7 +298,7 @@ async function loadMonths(token) {
     if (!Array.isArray(data)) throw new Error("not an array");
     months = data.filter((m) => typeof m === "string" && MONTH_RE.test(m));
   } catch (e) {
-    if (token === loadToken) setStatus("月の一覧（data/months.json）を取得できませんでした。", true);
+    if (token === loadToken) setStatus("月の一覧（data/months.json）を取得できませんでした。", true, startDaily);
     return;
   }
   if (months.length === 0) {
@@ -229,11 +312,6 @@ async function loadMonths(token) {
     select.appendChild(opt);
   }
   syncDailyControls();
-  select.addEventListener("change", () => showMonth(select.value));
-  orderSelect.addEventListener("change", () => {
-    sortOrder = orderSelect.value === "asc" ? "asc" : "desc";
-    if (current) renderMonth(current.ym, current.days, sortOrder); // 再取得せず再描画（開閉は最新日のみ展開に戻る）
-  });
 }
 
 // 検索中は月の選択・並び順を無効にする（検索は全期間・新しい順）。
@@ -248,10 +326,15 @@ function syncDailyControls() {
 function showDaily() {
   if (searchQuery) {
     showSearch();
-  } else if (current) {
-    ++loadToken; // 週刊・月刊・検索の読み込み中の応答で上書きしない
-    setStatus("");
-    renderMonth(current.ym, current.days, sortOrder);
+  } else if (select.options.length) {
+    selectDailyMonth();
+    if (current && current.ym === select.value) {
+      ++loadToken; // 週刊・月刊・検索の読み込み中の応答で上書きしない
+      setStatus("");
+      renderMonth(current.ym, current.days, sortOrder);
+    } else {
+      showMonth(select.value);
+    }
   } else {
     startDaily();
   }
@@ -276,7 +359,7 @@ async function showSearch() {
     try {
       await loadSearchEntries();
     } catch (e) {
-      if (token === loadToken) setStatus("検索データ（data/search-index.json）を取得できませんでした。", true);
+      if (token === loadToken) setStatus("検索データ（data/search-index.json）を取得できませんでした。", true, showSearch);
       return;
     }
     if (token !== loadToken) return;
@@ -286,6 +369,7 @@ async function showSearch() {
 
 function renderSearch(query, results) {
   setStatus("");
+  if (descObserver) descObserver.disconnect();
   const frag = document.createDocumentFragment();
   const head = el("div", "month-head");
   head.appendChild(el("h2", "", "検索結果"));
@@ -296,6 +380,7 @@ function renderSearch(query, results) {
     frag.appendChild(el("p", "search-empty",
       "該当する記事はありません。キーワードを減らすか、別の表記（略称・正式名称など）でお試しください。"));
     content.replaceChildren(frag);
+    finishRender();
     return;
   }
   const cards = el("div", "theme-cards search-results");
@@ -303,25 +388,53 @@ function renderSearch(query, results) {
   const more = el("button", "more");
   more.type = "button";
   let shown = 0;
-  const showMore = () => {
+  const memoryKey = `search:${query}`;
+  const showMore = (activated = false) => {
     const next = results.slice(shown, shown + SEARCH_PAGE_SIZE);
-    for (const item of next) cards.appendChild(renderCard(item));
+    let firstAdded = null;
+    for (const item of next) {
+      const card = renderCard(item);
+      firstAdded ??= card;
+      cards.appendChild(card);
+    }
     shown += next.length;
+    if (!activated) return;
+    remember(memoryKey, { shown });
+    // 最後の追加で消えるボタンから、今回追加した先頭記事へ移る（ページ先頭へ戻らない）。
+    if (shown >= results.length && document.activeElement === more) {
+      const target = firstAdded.querySelector(".card-title a") || firstAdded.querySelector(".card-title");
+      if (target.tagName !== "A") target.tabIndex = -1;
+      target.focus();
+    }
+    syncMore();
+    setStatus(`${results.length}件中${shown}件を表示しました。`, false, null, true);
+  };
+  const syncMore = () => {
     more.hidden = shown >= results.length;
     more.textContent = `さらに表示（残り${results.length - shown}件）`;
   };
-  more.addEventListener("click", showMore);
-  showMore();
+  more.addEventListener("click", () => showMore(true));
+  const remembered = readingMemory.get(memoryKey)?.shown || SEARCH_PAGE_SIZE;
+  while (shown < Math.min(remembered, results.length)) showMore();
+  syncMore();
   frag.appendChild(more);
   content.replaceChildren(frag);
+  finishRender();
 }
 
-function applySearch(value) {
+function normalizeQuery(value) {
+  return value.trim().replace(/\s+/g, " ").slice(0, QUERY_MAX);
+}
+
+// how: "push"=確定操作、"replace"=入力途中の履歴を確定、"query"=入力途中（連続入力は1つの履歴にまとめる）
+function applySearch(value, how = "push") {
   clearTimeout(searchTimer);
-  const query = value.trim().replace(/\s+/g, " ");
-  if (query === searchQuery) return; // 空白の追加など、結果が変わらない入力では再描画しない
+  const query = normalizeQuery(value);
+  if (query === searchQuery) { if (how !== "query") editingQuery = false; return; } // 結果が変わらない入力では再描画しない
   searchQuery = query;
+  restoreScroll = false;
   syncDailyControls();
+  commitURL(how);
   if (mode === "daily") showDaily(); // 空欄に戻したら通常の日刊表示へ
 }
 
@@ -330,19 +443,30 @@ function initSearch() {
     syncDailyControls();
     if (e.isComposing) return; // 日本語入力の変換中は検索しない（確定時に compositionend で検索）
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => applySearch(searchInput.value), SEARCH_DELAY_MS);
+    searchTimer = setTimeout(() => applySearch(searchInput.value, "query"), SEARCH_DELAY_MS);
   });
   searchInput.addEventListener("compositionend", () => {
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => applySearch(searchInput.value), SEARCH_DELAY_MS);
+    searchTimer = setTimeout(() => applySearch(searchInput.value, "query"), SEARCH_DELAY_MS);
   });
   searchInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.isComposing) applySearch(searchInput.value);
+    if (e.key === "Enter" && !e.isComposing) applySearch(searchInput.value, editingQuery ? "replace" : "push");
   });
   searchClear.addEventListener("click", () => {
     searchInput.value = "";
     applySearch("");
     searchInput.focus();
+  });
+  select.addEventListener("change", () => {
+    dailyMonth = select.value;
+    restoreScroll = false;
+    commitURL("push");
+    showMonth(select.value);
+  });
+  orderSelect.addEventListener("change", () => {
+    sortOrder = orderSelect.value === "asc" ? "asc" : "desc";
+    commitURL("push");
+    if (current) renderMonth(current.ym, current.days, sortOrder); // 再取得せず再描画（開いていた日付は維持）
   });
 }
 
@@ -356,7 +480,7 @@ function renderReview(cfg, entry, review) {
   const head = el("header", "weekly-head");
   if (review.title) head.appendChild(el("p", "weekly-kicker", review.title));
   head.appendChild(el("h2", "", cfg.title(entry[cfg.key])));
-  head.appendChild(el("p", "weekly-period", `対象期間：${review.period || rangeLabel(entry.start, entry.end)}`));
+  head.appendChild(el("p", "weekly-period", `対象期間：${review.period || rangeLabel(entry.start, entry.end)}（この期間に取得した記事が対象）`));
   article.appendChild(head);
 
   if (review.overview.length) {
@@ -414,27 +538,30 @@ function renderReview(cfg, entry, review) {
     article.appendChild(foot);
   }
   content.replaceChildren(article);
+  finishRender();
 }
 
-async function showReview(kind, id) {
+async function showReview(kind, id, how = "replace") {
   const cfg = REVIEWS[kind];
   const entry = cfg.entries && cfg.entries.find((e) => e[cfg.key] === id);
   if (!entry || mode !== kind) return;
   const token = ++loadToken;
   content.replaceChildren();
   setStatus("読み込み中...");
-  setHash(`${kind}/${id}`);
+  cfg.select.value = id;
+  reviewIds[kind] = id;
+  commitURL(how);
   let text;
   try {
     text = await fetchText(cfg.path(id));
   } catch (e) {
-    if (token === loadToken) setStatus(`${cfg.title(id)}の${cfg.name}を取得できませんでした。`, true);
+    if (token === loadToken) setStatus(`${cfg.title(id)}の${cfg.name}を取得できませんでした。`, true, () => showReview(kind, id));
     return;
   }
   if (token !== loadToken) return;
   const review = parseReview(text);
   if (!review.overview.length && !review.topics.length) {
-    setStatus(`${cfg.title(id)}の${cfg.name}を表示できませんでした。`, true);
+    setStatus(`${cfg.title(id)}の${cfg.name}を表示できませんでした。`, true, () => showReview(kind, id));
     return;
   }
   setStatus("");
@@ -453,8 +580,9 @@ async function startReview(kind, preferred) {
       if (!Array.isArray(data)) throw new Error("not an array");
       list = data.filter((e) => e && cfg.keyRe.test(e[cfg.key]) && DATE_RE.test(e.start) && DATE_RE.test(e.end));
     } catch (e) {
-      if (token === loadToken) setStatus(`${cfg.listName}（${cfg.index}）を取得できませんでした。`, true);
-      return; // 次にタブを開いたときに再試行する
+      // 状態（モード・指定の号）を保ったまま、同じ取得をその場で再実行できる。
+      if (token === loadToken) setStatus(`${cfg.listName}（${cfg.index}）を取得できませんでした。`, true, () => startReview(kind, preferred));
+      return;
     }
     if (cfg.entries === null) {
       cfg.entries = list;
@@ -475,13 +603,32 @@ async function startReview(kind, preferred) {
   showReview(kind, cfg.select.value || cfg.entries[0][cfg.key]); // 一覧は新しい順。先頭=最新
 }
 
-// ---- 日刊／週刊／月刊の切り替え（#weekly/2026-W42・#monthly/2026-10 で直接開ける） -----------
-function setHash(value) {
-  const url = value ? `#${value}` : location.pathname + location.search;
-  if (location.hash !== (value ? `#${value}` : "")) history.replaceState(null, "", url);
+// ---- 日刊／週刊／月刊の切り替えとURL ----------------------------------------------------
+// 週刊・月刊は #weekly/2026-W42・#monthly/2026-10、日刊は ?month=2026-10&order=asc&q=検索語 で表す。
+// 確定した操作は履歴に追加し、戻る・進む・再読み込み・別タブで同じ表示を復元する。
+function buildURL() {
+  if (REVIEWS[mode]) return location.pathname + `#${mode}` + (reviewIds[mode] ? `/${reviewIds[mode]}` : "");
+  const params = new URLSearchParams();
+  if (select.value) params.set("month", select.value);
+  else if (dailyMonth) params.set("month", dailyMonth);
+  if (sortOrder === "asc") params.set("order", "asc");
+  if (searchQuery) params.set("q", searchQuery);
+  const search = params.toString();
+  return location.pathname + (search ? `?${search}` : "");
 }
 
-function setMode(next, preferred) {
+// how: "push"=履歴に追加、"replace"=現在の履歴を更新、"query"=検索語の入力途中（連続入力は置き換え）
+function commitURL(how) {
+  const url = buildURL();
+  if (url !== location.pathname + location.search + location.hash) {
+    const replace = how === "replace" || (how === "query" && editingQuery);
+    history[replace ? "replaceState" : "pushState"](null, "", url);
+  }
+  editingQuery = how === "query";
+}
+
+function setMode(next, preferred, how = "push") {
+  if (next === "daily" && mode !== "daily") restoreScroll = true;
   mode = next;
   for (const [name, button] of Object.entries(modeButtons)) {
     button.setAttribute("aria-pressed", String(name === next));
@@ -489,12 +636,33 @@ function setMode(next, preferred) {
   dailyControls.hidden = next !== "daily";
   for (const [kind, cfg] of Object.entries(REVIEWS)) cfg.controls.hidden = next !== kind;
   if (REVIEWS[next]) {
-    setHash(next);
-    startReview(next, preferred);
+    if (preferred) reviewIds[next] = preferred;
+    commitURL(how);
+    startReview(next, reviewIds[next]);
   } else {
-    setHash("");
+    commitURL(how);
     showDaily();
   }
+}
+
+// 現在のURLから表示を復元する（初期表示・戻る/進む・アドレス欄でのハッシュ変更）。
+function applyURL() {
+  const target = parseHash(location.hash);
+  clearTimeout(searchTimer);
+  editingQuery = false;
+  retryFocus = false;
+  restoreScroll = true;
+  if (target.mode === "daily") {
+    const params = new URLSearchParams(location.search);
+    const month = params.get("month") || "";
+    dailyMonth = MONTH_RE.test(month) ? month : "";
+    sortOrder = params.get("order") === "asc" ? "asc" : "desc";
+    orderSelect.value = sortOrder;
+    searchQuery = normalizeQuery(params.get("q") || "");
+    searchInput.value = searchQuery;
+    syncDailyControls();
+  }
+  setMode(target.mode, target.id, "replace");
 }
 
 function parseHash(hash) {
@@ -510,10 +678,26 @@ function init() {
     button.addEventListener("click", () => { if (mode !== name) setMode(name); });
   }
   for (const [kind, cfg] of Object.entries(REVIEWS)) {
-    cfg.select.addEventListener("change", () => showReview(kind, cfg.select.value));
+    cfg.select.addEventListener("change", () => showReview(kind, cfg.select.value, "push"));
   }
-  const target = parseHash(location.hash);
-  setMode(target.mode, target.id);
+  retryButton.addEventListener("click", () => {
+    const action = retryAction;
+    if (!action) return;
+    retryFocus = true;
+    statusEl.focus(); // ボタンが隠れてもフォーカスを失わない（結果が出たら見出し・再試行へ移る）
+    action();
+  });
+  window.addEventListener("popstate", applyURL);
+  let scrollFrame = 0;
+  window.addEventListener("scroll", () => {
+    if (scrollFrame) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = 0;
+      // 日刊の一覧を表示している間だけ記録する（切替・読み込み中の空表示では記録しない）。
+      if (mode === "daily" && content.childNodes.length && !restoreScroll && !restoringScroll) remember(dailyKey(), { scroll: window.scrollY });
+    });
+  }, { passive: true });
+  applyURL();
 }
 
 init();
