@@ -77,7 +77,7 @@ body {
   border-radius: 2px;
 }
 .search-box input::placeholder { color: var(--muted); opacity: 1; }
-.search-box button, .more {
+.search-box button, .more, .retry {
   font: inherit;
   min-height: 44px;
   padding: 0 16px;
@@ -88,7 +88,7 @@ body {
   cursor: pointer;
 }
 .search-box button:disabled { color: var(--muted); cursor: default; }
-.search-box button:not(:disabled):hover, .more:hover { background: var(--band); }
+.search-box button:not(:disabled):hover, .more:hover, .retry:hover { background: var(--band); }
 .search-summary { margin: 12px 0 20px; color: var(--muted); font-size: .94rem; }
 .search-empty { margin: 0; padding: 16px 0; }
 .more { display: block; margin: 24px auto 0; }
@@ -120,7 +120,10 @@ select {
   max-width: 100%;
 }
 main.wrap { padding-top: 32px; padding-bottom: 72px; }
+.status-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.status-row .retry[hidden] { display: none; }
 #status { color: var(--muted); padding: 16px 0; }
+#status:focus { outline: none; }
 #status.error { color: var(--error); }
 .month-head {
   display: flex; align-items: baseline; flex-wrap: wrap;
@@ -156,6 +159,8 @@ main.wrap { padding-top: 32px; padding-bottom: 72px; }
 .day[open] > .day-summary::before { transform: rotate(45deg); }
 .day-summary:hover { background: var(--band); }
 .day-title { min-width: 0; }
+.day-date, .day-summary .count, .day-summary .latest { white-space: nowrap; }
+@media (max-width: 480px) { .day-summary { flex-wrap: wrap; row-gap: 2px; } }
 .theme { margin: 10px 0 24px; }
 .theme-title {
   margin: 0 0 12px;
@@ -205,6 +210,23 @@ main.wrap { padding-top: 32px; padding-bottom: 72px; }
   line-clamp: 3;
   overflow: hidden;
 }
+.desc.expanded { display: block; -webkit-line-clamp: none; line-clamp: none; overflow: visible; }
+.desc-toggle {
+  align-self: flex-start;
+  margin: -6px 0 12px;
+  padding: 4px 0;
+  min-height: 32px;
+  font: inherit;
+  font-size: .875rem;
+  color: var(--accent);
+  background: none;
+  border: 0;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.desc-toggle[hidden] { display: none; }
+.day-label { margin-right: .5em; color: var(--muted); font-size: .875rem; font-weight: 400; }
 .card-bottom { margin-top: auto; padding-top: 4px; }
 .open {
   display: inline-block;
@@ -219,9 +241,7 @@ main.wrap { padding-top: 32px; padding-bottom: 72px; }
   color: var(--muted);
   font-size: .875rem;
   line-height: 1.45;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere; /* 狭幅でも省略せず折り返す */
 }
 .latest {
   flex: none;
