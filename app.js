@@ -37,7 +37,6 @@ let retryAction = null;
 let retryFocus = false; // 再試行後、成功したら見出し・失敗したら再試行ボタンへフォーカスを戻す
 // 同じページ内で同じ月・検索語へ戻ったとき、開いていた日付と追加表示件数を再現する一時メモ（永続化しない）。
 const readingMemory = new Map();
-const QUERY_MAX = 200;
 let restoreScroll = false; // 戻る・日刊への切替で戻ったときだけ、記録した閲覧位置へ戻す
 let restoringScroll = false;
 
@@ -423,7 +422,7 @@ function renderSearch(query, results) {
 }
 
 function normalizeQuery(value) {
-  return value.trim().replace(/\s+/g, " ").slice(0, QUERY_MAX);
+  return value.trim().replace(/\s+/g, " ");
 }
 
 // how: "push"=確定操作、"replace"=入力途中の履歴を確定、"query"=入力途中（連続入力は1つの履歴にまとめる）
