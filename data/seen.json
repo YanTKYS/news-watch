@@ -56,6 +56,9 @@
   "https://ascii.jp/elem/000/004/451/4451687?rss=": {
     "first_seen": "2026-11-16"
   },
+  "https://ascii.jp/elem/000/004/451/4451863?rss=": {
+    "first_seen": "2026-11-17"
+  },
   "https://aws.amazon.com/jp/solutions/case-studies/misawa-city": {
     "first_seen": "2026-09-30"
   },
@@ -209,6 +212,9 @@
   "https://news.yahoo.co.jp/articles/f72351f96e6e53d21f6c5eaac6c6b191ce1ae184": {
     "first_seen": "2026-11-10"
   },
+  "https://newscast.jp/news/4406757": {
+    "first_seen": "2026-11-17"
+  },
   "https://note.com/kawauchi_yakusho/n/n398a5fc531ab": {
     "first_seen": "2026-11-05"
   },
@@ -223,6 +229,9 @@
   },
   "https://note.imacrea.co.jp/n/nba7b5048515e?gs=fb17900651b7cddead90d827fa2e9a6c": {
     "first_seen": "2026-10-14"
+  },
+  "https://note.imacrea.co.jp/n/nc59c1592aaee?gs=72650cbb37bcc020567bfbabb4d56285": {
+    "first_seen": "2026-11-17"
   },
   "https://note.imacrea.co.jp/n/neacd65fba65b?gs=ac2da0bf338915fca8664b8af1600aba": {
     "first_seen": "2026-10-31"
@@ -323,6 +332,9 @@
   "https://prtimes.jp/main/html/rd/p/000000415.000132312.html": {
     "first_seen": "2026-11-09"
   },
+  "https://prtimes.jp/main/html/rd/p/000000417.000132312.html": {
+    "first_seen": "2026-11-17"
+  },
   "https://prtimes.jp/main/html/rd/p/000000527.000007306.html": {
     "first_seen": "2026-10-15"
   },
@@ -373,6 +385,9 @@
   },
   "https://trends.codecamp.jp/blogs/media/news-prt-88829-779": {
     "first_seen": "2026-10-07"
+  },
+  "https://trends.codecamp.jp/blogs/media/news-prt-92586-545": {
+    "first_seen": "2026-11-17"
   },
   "https://webtiger.jp/jichitai-genai": {
     "first_seen": "2026-10-12"
@@ -452,6 +467,9 @@
   "https://www.excite.co.jp/news/article/impress_watch_1477803680855408707": {
     "first_seen": "2026-10-04"
   },
+  "https://www.fnn.jp/articles/-/1153677": {
+    "first_seen": "2026-11-17"
+  },
   "https://www.hokkaido-np.co.jp/article/1391521": {
     "first_seen": "2026-10-20"
   },
@@ -479,6 +497,9 @@
   "https://www.itmedia.co.jp/business/articles/2611/12/news007.html": {
     "first_seen": "2026-11-14"
   },
+  "https://www.itmedia.co.jp/business/articles/2611/16/news048.html": {
+    "first_seen": "2026-11-17"
+  },
   "https://www.iza.ne.jp/pressrelease/prtimes/7VPB7Y6DNRM7TF5ALG3OGB2XUA": {
     "first_seen": "2026-09-30"
   },
@@ -505,6 +526,9 @@
   },
   "https://www.niigata-nippo.co.jp/articles/-/925498": {
     "first_seen": "2026-10-20"
+  },
+  "https://www.nikkei.com/article/DGXZQOCC162LG0W6A111C2000000": {
+    "first_seen": "2026-11-17"
   },
   "https://www.nikkei.com/article/DGXZQOFC2570K0V20C26A9000000": {
     "first_seen": "2026-09-30"
@@ -592,6 +616,9 @@
   },
   "https://www.tokyo-np.co.jp/article/526563": {
     "first_seen": "2026-11-10"
+  },
+  "https://www.value-press.com/pressrelease/384453": {
+    "first_seen": "2026-11-17"
   },
   "https://www.wacoca.com/news/2984573": {
     "first_seen": "2026-11-15"
